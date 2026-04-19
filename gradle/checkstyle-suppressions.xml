@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC
+    "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
+    "https://checkstyle.org/dtds/suppressions_1_2.dtd">
+
+<suppressions>
+    <!-- Star imports are fine in tests (bulk-import matchers from JUnit). -->
+    <suppress checks="AvoidStarImport" files="[\\/]src[\\/]test[\\/]"/>
+    <!-- Dot imports of our own sealed AST hierarchy — a switch-exhaustive case-by-case pattern matches much cleaner this way. -->
+    <suppress checks="AvoidStarImport" files="Binder\.java|Executor\.java|ExprEvaluator\.java|SqlParser\.java"/>
+    <!-- FieldSink / TsvConverter wildcards io.jpointdb.core.column.* on purpose. -->
+    <suppress checks="AvoidStarImport" files="FieldSink\.java|TsvConverter\.java"/>
+</suppressions>

@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>jpoint · sql</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/hint/show-hint.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/sql/sql.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/hint/show-hint.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/addon/edit/matchbrackets.min.js"></script>
+<style>
+:root {
+  --bg:      #0b0e13;
+  --bg2:     #11161e;
+  --bg3:     #161c27;
+  --fg:      #c5d1de;
+  --dim:     #5b6b82;
+  --border:  #212a36;
+  --accent:  #7ee787;
+  --accent2: #39d0d8;
+  --blue:    #58a6ff;
+  --yellow:  #ffd866;
+  --pink:    #ff85c0;
+  --purple:  #c792ea;
+  --err:     #ff6b6b;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 20px 28px;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.logo {
+  color: var(--accent);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+.logo::before { content: "▣ "; color: var(--accent2); }
+.tag {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.meta {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 11px;
+}
+.meta .k { color: var(--accent2); }
+
+/* CodeMirror container */
+.editor {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg2);
+  box-shadow: 0 0 0 1px rgba(126, 231, 135, 0.04);
+}
+.editor:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(126, 231, 135, 0.12);
+}
+.CodeMirror {
+  height: 180px !important;
+  background: transparent !important;
+  color: var(--fg) !important;
+  font-family: inherit !important;
+  font-size: 13px !important;
+  padding: 6px 0;
+}
+.CodeMirror-gutters {
+  background: var(--bg3) !important;
+  border-right: 1px solid var(--border) !important;
+}
+.CodeMirror-linenumber {
+  color: var(--dim) !important;
+  padding: 0 10px 0 6px !important;
+}
+.CodeMirror-cursor {
+  border-left: 2px solid var(--accent) !important;
+}
+.CodeMirror-selected {
+  background: rgba(126, 231, 135, 0.18) !important;
+}
+.CodeMirror-matchingbracket {
+  color: var(--accent) !important;
+  text-decoration: underline;
+  background: rgba(57, 208, 216, 0.15);
+}
+
+/* Syntax tokens */
+.cm-keyword    { color: var(--pink); font-weight: 600; }
+.cm-atom       { color: var(--yellow); }
+.cm-number     { color: var(--yellow); }
+.cm-string     { color: var(--accent); }
+.cm-string-2   { color: var(--accent); }
+.cm-def        { color: var(--blue); }
+.cm-variable   { color: var(--fg); }
+.cm-variable-2 { color: var(--blue); }
+.cm-type       { color: var(--accent2); }
+.cm-punctuation,
+.cm-operator   { color: var(--dim); }
+.cm-comment    { color: var(--dim); font-style: italic; }
+
+/* Hint popup */
+.CodeMirror-hints {
+  background: var(--bg3) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--fg) !important;
+  font-family: inherit !important;
+  font-size: 12px !important;
+  padding: 3px 0 !important;
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+.CodeMirror-hint {
+  padding: 3px 10px !important;
+  color: var(--fg) !important;
+}
+.CodeMirror-hint-active {
+  background: var(--accent) !important;
+  color: var(--bg) !important;
+}
+
+/* Toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 12px 0 16px;
+}
+button {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 18px;
+  font-family: inherit;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: all 0.1s ease-out;
+}
+button:hover {
+  background: var(--accent);
+  color: var(--bg);
+  box-shadow: 0 0 12px rgba(126, 231, 135, 0.35);
+}
+button:active { transform: translateY(1px); }
+.kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10px;
+  color: var(--dim);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin: 0 2px;
+}
+.hints {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.2px;
+}
+#status {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: 11px;
+  font-family: inherit;
+}
+#status.ok  { color: var(--accent); }
+#status.err { color: var(--err); }
+
+/* Result table */
+.result-wrap {
+  overflow: auto;
+  max-height: 55vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg2);
+}
+table {
+  border-collapse: collapse;
+  font-family: inherit;
+  font-size: 12px;
+  width: max-content;
+  min-width: 100%;
+}
+th, td {
+  padding: 5px 12px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+th:last-child, td:last-child { border-right: 0; }
+th {
+  background: var(--bg3);
+  color: var(--blue);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+th .t { color: var(--dim); font-weight: 400; font-size: 10px; margin-left: 4px; }
+tr:nth-child(even) td { background: var(--bg3); }
+tr:hover td { background: rgba(57, 208, 216, 0.08); }
+td.null { color: var(--dim); font-style: italic; }
+td.num { color: var(--yellow); text-align: right; }
+td.str { color: var(--fg); }
+
+/* Empty + error states */
+#err {
+  margin-top: 10px;
+  color: var(--err);
+  white-space: pre-wrap;
+  font-size: 12px;
+  border-left: 3px solid var(--err);
+  padding: 6px 12px;
+  background: rgba(255, 107, 107, 0.08);
+  border-radius: 0 4px 4px 0;
+  display: none;
+}
+#err.visible { display: block; }
+.empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--dim);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg2); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">jpoint</span>
+  <span class="tag">columnar · analytical · sql</span>
+  <span class="meta" id="schema-meta"></span>
+</header>
+
+<div class="editor"><textarea id="sql">SELECT COUNT(*) FROM hits;</textarea></div>
+
+<div class="toolbar">
+  <button id="run">▶ run</button>
+  <span class="hints">
+    <span class="kbd">⌘/Ctrl ↵</span> run
+    <span class="kbd">⌃Space</span> complete
+    <span class="kbd">↑ ↓</span> history
+  </span>
+  <span id="status"></span>
+</div>
+
+<div class="result-wrap" id="result">
+  <div class="empty">ready.</div>
+</div>
+<div id="err"></div>
+
+<script>
+const SQL_KEYWORDS = [
+  "SELECT","FROM","WHERE","GROUP BY","HAVING","ORDER BY","LIMIT","OFFSET",
+  "AS","AND","OR","NOT","IN","LIKE","IS NULL","IS NOT NULL","DISTINCT",
+  "ASC","DESC","CASE","WHEN","THEN","ELSE","END","BETWEEN",
+  "COUNT(*)","COUNT(","SUM(","AVG(","MIN(","MAX("
+];
+const TYPES = { I32:"int32", I64:"int64", F64:"float64", STRING:"string" };
+let COLUMNS = [];
+let TABLE_NAME = "t";
+
+// CodeMirror needs to be loaded before we construct editor, so wait for DOMContentLoaded.
+document.addEventListener("DOMContentLoaded", init);
+
+async function init() {
+  await loadSchema();
+  const ta = document.getElementById("sql");
+  const editor = CodeMirror.fromTextArea(ta, {
+    mode: "text/x-sql",
+    lineNumbers: true,
+    matchBrackets: true,
+    indentUnit: 2,
+    viewportMargin: Infinity,
+    extraKeys: {
+      "Cmd-Enter":   run,
+      "Ctrl-Enter":  run,
+      "Ctrl-Space":  triggerHint,
+      "Cmd-Space":   triggerHint,
+      "Tab":         (cm) => cm.replaceSelection("  ", "end")
+    }
+  });
+  // Auto-complete as the user types letters.
+  editor.on("inputRead", (cm, change) => {
+    if (change.origin !== "+input") return;
+    const text = change.text.join("");
+    if (/^[A-Za-z_]$/.test(text)) {
+      cm.showHint({ hint: hintFn, completeSingle: false });
+    }
+  });
+
+  document.getElementById("run").addEventListener("click", () => runCurrent(editor));
+  window.__editor = editor;
+
+  // Command-line-ish history across runs via localStorage.
+  const hist = JSON.parse(localStorage.getItem("jpoint.history") || "[]");
+  let histIdx = hist.length;
+  editor.on("keydown", (cm, ev) => {
+    if (!ev.altKey) return;
+    if (ev.key === "ArrowUp" && histIdx > 0) {
+      histIdx--;
+      cm.setValue(hist[histIdx]);
+      ev.preventDefault();
+    } else if (ev.key === "ArrowDown" && histIdx < hist.length - 1) {
+      histIdx++;
+      cm.setValue(hist[histIdx]);
+      ev.preventDefault();
+    }
+  });
+  window.__history = { list: hist, get idx() { return histIdx; }, set idx(v) { histIdx = v; } };
+}
+
+async function loadSchema() {
+  try {
+    const resp = await fetch("/schema");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    COLUMNS = data.columns.map(c => ({ name: c.name, type: c.type }));
+    TABLE_NAME = data.name || "t";
+    document.getElementById("schema-meta").innerHTML =
+      `<span class="k">table</span> ${TABLE_NAME} · ` +
+      `<span class="k">rows</span> ${data.rowCount.toLocaleString()} · ` +
+      `<span class="k">cols</span> ${data.columns.length}`;
+    const placeholder = document.getElementById("sql");
+    if (placeholder.value.trim() === "SELECT COUNT(*) FROM hits;" && TABLE_NAME !== "hits") {
+      placeholder.value = `SELECT COUNT(*) FROM ${TABLE_NAME};`;
+    }
+  } catch (e) { /* server maybe not ready — ignore */ }
+}
+
+function hintFn(cm) {
+  const cur = cm.getCursor();
+  const line = cm.getLine(cur.line);
+  let start = cur.ch;
+  while (start > 0 && /[A-Za-z0-9_]/.test(line[start - 1])) start--;
+  const word = line.slice(start, cur.ch);
+  const lc = word.toLowerCase();
+  const pool = [
+    ...COLUMNS.map(c => ({ text: c.name, displayText: c.name + " · " + (TYPES[c.type] || c.type) })),
+    ...SQL_KEYWORDS.map(k => ({ text: k, displayText: k }))
+  ];
+  const list = pool
+    .filter(c => c.text.toLowerCase().startsWith(lc) && c.text.toLowerCase() !== lc)
+    .slice(0, 40);
+  if (list.length === 0) return null;
+  return { list, from: CodeMirror.Pos(cur.line, start), to: cur };
+}
+
+function triggerHint(cm) { cm.showHint({ hint: hintFn, completeSingle: false }); }
+
+function run() { runCurrent(window.__editor); }
+
+async function runCurrent(editor) {
+  const sql = editor.getValue().trim();
+  if (!sql) return;
+
+  // Push to history (dedupe consecutive duplicates).
+  const hist = window.__history.list;
+  if (hist.length === 0 || hist[hist.length - 1] !== sql) hist.push(sql);
+  if (hist.length > 200) hist.splice(0, hist.length - 200);
+  localStorage.setItem("jpoint.history", JSON.stringify(hist));
+  window.__history.idx = hist.length;
+
+  const status = document.getElementById("status");
+  const result = document.getElementById("result");
+  const err = document.getElementById("err");
+  status.className = "";
+  status.textContent = "running…";
+  err.classList.remove("visible");
+  err.textContent = "";
+  result.innerHTML = '<div class="empty">…</div>';
+
+  const t0 = performance.now();
+  try {
+    const resp = await fetch("/query", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: sql
+    });
+    const body = await resp.text();
+    let data;
+    try { data = JSON.parse(body); } catch (_) {
+      err.textContent = "Invalid JSON (HTTP " + resp.status + "): " + body;
+      err.classList.add("visible");
+      status.className = "err"; status.textContent = "failed";
+      result.innerHTML = "";
+      return;
+    }
+    if (!resp.ok) {
+      err.textContent = (data.error || resp.statusText);
+      err.classList.add("visible");
+      status.className = "err";
+      status.textContent = "error " + resp.status;
+      result.innerHTML = "";
+      return;
+    }
+    const ms = Math.round(performance.now() - t0);
+    status.className = "ok";
+    status.textContent = data.rowCount + " row" + (data.rowCount === 1 ? "" : "s") +
+      " · " + data.elapsedMs + " ms (engine) · " + ms + " ms (roundtrip)";
+    result.innerHTML = "";
+    result.appendChild(renderTable(data));
+  } catch (e) {
+    err.textContent = "network: " + e.message;
+    err.classList.add("visible");
+    status.className = "err"; status.textContent = "failed";
+    result.innerHTML = "";
+  }
+}
+
+function renderTable(data) {
+  if (data.rows.length === 0) {
+    const d = document.createElement("div");
+    d.className = "empty";
+    d.textContent = "(no rows)";
+    return d;
+  }
+  const t = document.createElement("table");
+  const thead = document.createElement("thead");
+  const trh = document.createElement("tr");
+  const colTypes = data.columns.map(c => c.type);
+  for (const c of data.columns) {
+    const th = document.createElement("th");
+    th.innerHTML = escapeHtml(c.name) + '<span class="t">' + escapeHtml(TYPES[c.type] || c.type.toLowerCase()) + '</span>';
+    trh.appendChild(th);
+  }
+  thead.appendChild(trh);
+  t.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const row of data.rows) {
+    const tr = document.createElement("tr");
+    for (let i = 0; i < row.length; i++) {
+      const v = row[i];
+      const td = document.createElement("td");
+      if (v === null) {
+        td.className = "null";
+        td.textContent = "∅";
+      } else {
+        const type = colTypes[i];
+        if (type === "I32" || type === "I64" || type === "F64") {
+          td.className = "num";
+        } else {
+          td.className = "str";
+        }
+        td.textContent = String(v);
+      }
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  t.appendChild(tbody);
+  return t;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  }[c]));
+}
+</script>
+</body>
+</html>

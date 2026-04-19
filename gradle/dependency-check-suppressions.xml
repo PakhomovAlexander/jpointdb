@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <!--
+        Suppress false-positive CVEs tied to unrelated projects that share a vendor/product
+        substring with our deps. Add entries here with a # justification as they appear.
+    -->
+</suppressions>

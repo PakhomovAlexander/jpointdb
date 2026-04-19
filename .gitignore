@@ -1,0 +1,19 @@
+.gradle/
+build/
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+out/
+bin/
+.DS_Store
+
+# JPointDB local data
+*.jpdb/
+data/
+*.tsv
+
+# Bench sample — downloaded by bench/scripts/setup-golden.sh
+bench/sample/
+

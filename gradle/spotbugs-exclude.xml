@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter xmlns="https://github.com/spotbugs/filter/3.0.0"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xsi:schemaLocation="https://github.com/spotbugs/filter/3.0.0 https://raw.githubusercontent.com/spotbugs/spotbugs/master/spotbugs/etc/findbugsfilter.xsd">
+
+    <!-- Don't scan tests; they intentionally do "smelly" things (try/catch ignored, etc.). -->
+    <Match>
+        <Source name="~.*[/\\]src[/\\]test[/\\].*"/>
+    </Match>
+
+    <!-- Record classes expose their byte[] MAGIC constants by design — we control all callers. -->
+    <Match>
+        <Class name="~io\.jpointdb\.core\.column\..*Format"/>
+        <Bug pattern="MS_MUTABLE_ARRAY"/>
+    </Match>
+
+    <!-- Record accessors returning mutable arrays / maps are idiomatic in records and guarded
+         at construction by List.copyOf. -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+</FindBugsFilter>
