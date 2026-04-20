@@ -163,6 +163,12 @@ public final class StringColumn implements AutoCloseable {
     }
 
     public String valueAsString(long i) {
+        if (mode == StringColumnWriter.Mode.DICT) {
+            Dictionary d = dict;
+            if (d == null)
+                throw new IllegalStateException("dict missing in DICT mode");
+            return d.stringAt(ids.get(ValueLayout.JAVA_INT, i * 4));
+        }
         return new String(valueBytes(i), StandardCharsets.UTF_8);
     }
 

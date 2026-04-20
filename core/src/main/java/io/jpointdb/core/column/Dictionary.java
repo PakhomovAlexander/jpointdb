@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * Mmapped reader for a dictionary file written by
  * {@link DictionaryBuilder#writeToFile}. Exposes key bytes by ID without
@@ -20,12 +22,17 @@ public final class Dictionary implements AutoCloseable {
     private final MemorySegment offsets;
     private final MemorySegment keyBytes;
     private final int size;
+    // Lazy String cache by dict id. First read decodes UTF-8 and stores;
+    // subsequent reads return the cached reference for free. Data race on
+    // a slot is benign — Strings are immutable and keyAsString(id) is pure.
+    private final @Nullable String[] stringCache;
 
     private Dictionary(Arena arena, MemorySegment offsets, MemorySegment keyBytes, int size) {
         this.arena = arena;
         this.offsets = offsets;
         this.keyBytes = keyBytes;
         this.size = size;
+        this.stringCache = new String[size];
     }
 
     public static Dictionary open(Path file) throws IOException {
@@ -92,6 +99,19 @@ public final class Dictionary implements AutoCloseable {
 
     public String keyAsString(int id) {
         return new String(keyBytes(id), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Returns the cached {@link String} for {@code id}, decoding it from
+     * UTF-8 on the first access. Subsequent reads skip allocation entirely.
+     */
+    public String stringAt(int id) {
+        String s = stringCache[id];
+        if (s != null)
+            return s;
+        s = keyAsString(id);
+        stringCache[id] = s;
+        return s;
     }
 
     public MemorySegment keyBytesSegment() {
