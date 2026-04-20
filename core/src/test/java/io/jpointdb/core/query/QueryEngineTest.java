@@ -103,6 +103,26 @@ class QueryEngineTest {
     }
 
     @Test
+    void likeShapes(@TempDir Path dir) throws IOException {
+        try (Table t = convertAndOpen(dir,
+                "abc\nabcdef\nxyzabc\nexact\nfoo_bar\n", List.of("s"))) {
+            String table = tableName(t);
+            assertEquals(1L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'exact'")
+                    .rows().get(0)[0]);
+            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'abc%'")
+                    .rows().get(0)[0]);
+            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc'")
+                    .rows().get(0)[0]);
+            assertEquals(3L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc%'")
+                    .rows().get(0)[0]);
+            assertEquals(1L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'foo_bar'")
+                    .rows().get(0)[0]);
+            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s NOT LIKE '%abc%'")
+                    .rows().get(0)[0]);
+        }
+    }
+
+    @Test
     void filterOnInteger(@TempDir Path dir) throws IOException {
         try (Table t = convertAndOpen(dir, "1\n2\n3\n4\n5\n", List.of("x"))) {
             QueryResult r = QueryEngine.run(t, "SELECT COUNT(*) FROM " + tableName(t) + " WHERE x BETWEEN 2 AND 4");

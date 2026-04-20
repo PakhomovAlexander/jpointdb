@@ -12,6 +12,7 @@ import io.jpointdb.core.sql.ValueType;
 import io.jpointdb.core.table.Table;
 import org.jspecify.annotations.Nullable;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -240,8 +241,66 @@ public final class ExprEvaluator {
         if (!(v instanceof String s) || !(p instanceof String pat)) {
             throw new SqlException("LIKE requires string arguments", 0);
         }
-        boolean m = Pattern.compile(likeToRegex(pat), Pattern.DOTALL).matcher(s).matches();
+        boolean m = likeMatcherFor(pat).matches(s);
         return l.negated() ? !m : m;
+    }
+
+    @FunctionalInterface
+    interface LikeMatcher {
+        boolean matches(String s);
+    }
+
+    private static final ConcurrentHashMap<String, LikeMatcher> LIKE_CACHE = new ConcurrentHashMap<>();
+
+    static LikeMatcher likeMatcherFor(String pat) {
+        LikeMatcher m = LIKE_CACHE.get(pat);
+        if (m != null)
+            return m;
+        return LIKE_CACHE.computeIfAbsent(pat, ExprEvaluator::buildLikeMatcher);
+    }
+
+    /**
+     * Builds the fastest matcher for a SQL LIKE pattern. Literal-only patterns
+     * (no wildcards → equals) and single-run {@code %}-delimited patterns with
+     * no {@code _} wildcard short-circuit into {@link String#contains},
+     * {@link String#startsWith}, or {@link String#endsWith} — each of which
+     * HotSpot lowers to a byte-level SIMD intrinsic on Latin-1 strings. Falls
+     * back to a compiled regex (one compile per distinct pattern, not per row).
+     */
+    private static LikeMatcher buildLikeMatcher(String pat) {
+        int len = pat.length();
+        boolean hasPct = false;
+        boolean hasUnderscore = false;
+        for (int i = 0; i < len; i++) {
+            char c = pat.charAt(i);
+            if (c == '%')
+                hasPct = true;
+            else if (c == '_')
+                hasUnderscore = true;
+        }
+        if (!hasPct && !hasUnderscore) {
+            return s -> s.equals(pat);
+        }
+        if (!hasUnderscore) {
+            int first = pat.indexOf('%');
+            int last = pat.lastIndexOf('%');
+            if (first == 0 && last == len - 1) {
+                String mid = pat.substring(1, len - 1);
+                if (mid.indexOf('%') < 0) {
+                    if (mid.isEmpty())
+                        return s -> true;
+                    return s -> s.contains(mid);
+                }
+            } else if (first == 0 && last == 0) {
+                String tail = pat.substring(1);
+                return s -> s.endsWith(tail);
+            } else if (first == len - 1 && last == len - 1) {
+                String head = pat.substring(0, len - 1);
+                return s -> s.startsWith(head);
+            }
+        }
+        Pattern p = Pattern.compile(likeToRegex(pat), Pattern.DOTALL);
+        return s -> p.matcher(s).matches();
     }
 
     private @Nullable Object evalInList(BoundInList il, long row) {
