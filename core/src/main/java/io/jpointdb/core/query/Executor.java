@@ -298,9 +298,19 @@ public final class Executor {
                 tasks[c] = ForkJoinPool.commonPool()
                         .submit(() -> scanAggChunkPrimitive(plan, table, aggs, shape, from, to));
             }
-            merged = new LongKeysAggMap(shape.width());
+            List<LongKeysAggMap> chunks = new ArrayList<>(k);
+            int totalHint = 0;
             for (ForkJoinTask<LongKeysAggMap> t : tasks) {
-                merged.merge(t.join(), aggs.size());
+                LongKeysAggMap m = t.join();
+                chunks.add(m);
+                totalHint += m.size();
+            }
+            // totalHint overestimates only when chunks share keys; under-allocating
+            // triggers repeated rehashes (Q33 with 1M unique keys used to pay ~15
+            // power-of-two grows during merge).
+            merged = new LongKeysAggMap(shape.width(), totalHint);
+            for (LongKeysAggMap m : chunks) {
+                merged.merge(m, aggs.size());
             }
         } else {
             merged = scanAggChunkPrimitive(plan, table, aggs, shape, 0, n);
@@ -324,7 +334,10 @@ public final class Executor {
     private static LongKeysAggMap scanAggChunkPrimitive(BoundSelect plan, Table table, List<BoundAgg> aggs,
             PrimitiveKeyShape shape, long from, long to) {
         ExprEvaluator ev = new ExprEvaluator(table);
-        LongKeysAggMap map = new LongKeysAggMap(shape.width());
+        // Pre-size per-chunk map to the chunk's row count — upper bound on distinct
+        // keys per chunk; avoids rehashing for high-cardinality GROUP BY.
+        int chunkHint = (int) Math.min((long) Integer.MAX_VALUE, Math.max(64L, to - from));
+        LongKeysAggMap map = new LongKeysAggMap(shape.width(), chunkHint);
         BoundExpr where = plan.where();
         LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
 

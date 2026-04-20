@@ -46,12 +46,21 @@ final class LongKeysAggMap {
     private Aggregator[] nullStates;
 
     LongKeysAggMap(int width) {
+        this(width, 64);
+    }
+
+    LongKeysAggMap(int width, int capacityHint) {
         if (width != 1 && width != 2) {
             throw new IllegalArgumentException("width must be 1 or 2");
         }
         this.width = width;
-        init(64);
-        orderKeys = new long[16 * width];
+        int cap = 16;
+        int target = (int) Math.min((long) Integer.MAX_VALUE, Math.max(16L, (long) (capacityHint / LOAD) + 1));
+        while (cap < target) {
+            cap <<= 1;
+        }
+        init(cap);
+        orderKeys = new long[Math.max(16 * width, capacityHint * width)];
     }
 
     private void init(int cap) {
