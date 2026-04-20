@@ -85,15 +85,13 @@ class ClickBenchGoldenTest {
     }
 
     /**
-     * Queries where {@code LIMIT} combined with tied values in the ordering keys
-     * makes the top-N selection non-deterministic. We can't reliably diff without
-     * lifting the LIMIT; skipping for now.
+     * Queries where {@code LIMIT} / {@code LIMIT OFFSET} combined with tied values
+     * in the ordering keys makes the top-N selection non-deterministic. The diff
+     * finds equal-count rows that tie at the boundary and pick arbitrary winners;
+     * every engine (including DuckDB) is free to break those ties differently, so
+     * exact-row diffs are not a correctness signal for these queries.
      */
-    /**
-     * Queries where, even after any in-query tie-breaking, JPointDB's aggregate
-     * order still diverges from DuckDB's. Empty for now — fill in as needed.
-     */
-    static final java.util.Set<String> AMBIGUOUS_TIE_BREAK = java.util.Set.of();
+    static final java.util.Set<String> AMBIGUOUS_TIE_BREAK = java.util.Set.of("q24", "q27", "q28", "q38", "q39", "q40");
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("queries")

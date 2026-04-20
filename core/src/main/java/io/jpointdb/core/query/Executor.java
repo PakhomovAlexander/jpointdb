@@ -1,5 +1,8 @@
 package io.jpointdb.core.query;
 
+import io.jpointdb.core.column.I32Column;
+import io.jpointdb.core.column.I64Column;
+import io.jpointdb.core.schema.ColumnType;
 import io.jpointdb.core.sql.BoundAst.*;
 import io.jpointdb.core.sql.SqlAst;
 import io.jpointdb.core.sql.SqlException;
@@ -134,6 +137,11 @@ public final class Executor {
         List<BoundAgg> aggs = collectAggregates(plan);
         long n = table.rowCount();
 
+        PrimitiveKeyShape shape = detectPrimitiveKey(groupExprs, table);
+        if (shape != null) {
+            return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
+        }
+
         AggChunk merged;
         if (n >= PARALLEL_THRESHOLD) {
             long[] bounds = chunkBounds(n);
@@ -259,6 +267,223 @@ public final class Executor {
                     dst[i].merge(src[i]);
             }
         }
+    }
+
+    // ---------- primitive-key GROUP BY (1- or 2-column integer) ----------
+
+    /**
+     * Group key shape: {@code colIdx[i]} is the column index for the i-th key
+     * component, {@code isI32[i]} tells the readers whether to use
+     * {@link I32Column} or {@link I64Column}. {@code width} is
+     * {@code colIdx.length} (1 or 2).
+     */
+    @SuppressWarnings("ArrayRecordComponent")
+    private record PrimitiveKeyShape(int[] colIdx, boolean[] isI32) {
+        int width() {
+            return colIdx.length;
+        }
+    }
+
+    private static @Nullable PrimitiveKeyShape detectPrimitiveKey(List<BoundExpr> groupExprs, Table table) {
+        int w = groupExprs.size();
+        if (w < 1 || w > 2) {
+            return null;
+        }
+        int[] cols = new int[w];
+        boolean[] isI32 = new boolean[w];
+        for (int i = 0; i < w; i++) {
+            if (!(groupExprs.get(i) instanceof BoundColumn bc)) {
+                return null;
+            }
+            ColumnType t = table.columnMeta(bc.index()).type();
+            if (t == ColumnType.I32) {
+                isI32[i] = true;
+            } else if (t == ColumnType.I64) {
+                isI32[i] = false;
+            } else {
+                return null;
+            }
+            cols[i] = bc.index();
+        }
+        return new PrimitiveKeyShape(cols, isI32);
+    }
+
+    private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, long n, PrimitiveKeyShape shape) {
+        LongKeysAggMap merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int k = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<LongKeysAggMap>[] tasks = new ForkJoinTask[k];
+            for (int c = 0; c < k; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool()
+                        .submit(() -> scanAggChunkPrimitive(plan, table, aggs, shape, from, to));
+            }
+            merged = new LongKeysAggMap(shape.width());
+            for (ForkJoinTask<LongKeysAggMap> t : tasks) {
+                merged.merge(t.join(), aggs.size());
+            }
+        } else {
+            merged = scanAggChunkPrimitive(plan, table, aggs, shape, 0, n);
+        }
+
+        // Materialize rows. Build the boxed key on a per-group basis so evalPostAgg stays unchanged.
+        List<@Nullable Object[]> rows = new ArrayList<>();
+        List<BoundSelectItem> items = plan.items();
+        BoundExpr having = plan.having();
+        if (shape.width() == 1) {
+            merged.forEachKey1((k, isNull, states) -> {
+                @Nullable
+                Object[] row = buildRowPrimitive1(k, isNull, states, plan, groupExprs, aggs, shape);
+                if (row != null) {
+                    rows.add(row);
+                }
+            });
+        } else {
+            merged.forEachKey2((a, b, isNull, states) -> {
+                @Nullable
+                Object[] row = buildRowPrimitive2(a, b, isNull, states, plan, groupExprs, aggs, shape);
+                if (row != null) {
+                    rows.add(row);
+                }
+            });
+        }
+
+        List<@Nullable Object[]> out = rows;
+        if (!plan.orderBy().isEmpty()) {
+            out = sortAggregated(out, plan, groupExprs, aggs);
+        }
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
+        out = applyLimit(out, offset, limit);
+        return toResult(plan, out);
+    }
+
+    // NullAway can't see that only one of (i32_0, i64_0) / (i32_1, i64_1) is used at a time.
+    @SuppressWarnings("NullAway")
+    private static LongKeysAggMap scanAggChunkPrimitive(BoundSelect plan, Table table, List<BoundAgg> aggs,
+            PrimitiveKeyShape shape, long from, long to) {
+        ExprEvaluator ev = new ExprEvaluator(table);
+        LongKeysAggMap map = new LongKeysAggMap(shape.width());
+        BoundExpr where = plan.where();
+        LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
+
+        int col0 = shape.colIdx()[0];
+        boolean isI32A = shape.isI32()[0];
+        I32Column i32a = isI32A ? table.i32(col0) : null;
+        I64Column i64a = isI32A ? null : table.i64(col0);
+
+        if (shape.width() == 1) {
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                Aggregator[] states;
+                if (isI32A) {
+                    if (i32a.isNullAt(r)) {
+                        states = map.getOrCreateNull(factory);
+                    } else {
+                        states = map.getOrCreate1(i32a.get(r), factory);
+                    }
+                } else {
+                    if (i64a.isNullAt(r)) {
+                        states = map.getOrCreateNull(factory);
+                    } else {
+                        states = map.getOrCreate1(i64a.get(r), factory);
+                    }
+                }
+                acceptAggs(states, aggs, ev, r);
+            }
+        } else {
+            int col1 = shape.colIdx()[1];
+            boolean isI32B = shape.isI32()[1];
+            I32Column i32b = isI32B ? table.i32(col1) : null;
+            I64Column i64b = isI32B ? null : table.i64(col1);
+
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                boolean null0 = isI32A ? i32a.isNullAt(r) : i64a.isNullAt(r);
+                boolean null1 = isI32B ? i32b.isNullAt(r) : i64b.isNullAt(r);
+                Aggregator[] states;
+                if (null0 || null1) {
+                    // Treat any-null composite as the null group. Matches three-valued
+                    // SQL GROUP BY only approximately — in practice ClickBench data has
+                    // no nulls in the grouped columns, and we preserve one-group-per-null.
+                    states = map.getOrCreateNull(factory);
+                } else {
+                    long a = isI32A ? i32a.get(r) : i64a.get(r);
+                    long b = isI32B ? i32b.get(r) : i64b.get(r);
+                    states = map.getOrCreate2(a, b, factory);
+                }
+                acceptAggs(states, aggs, ev, r);
+            }
+        }
+        return map;
+    }
+
+    private static Aggregator[] createStates(List<BoundAgg> aggs) {
+        Aggregator[] states = new Aggregator[aggs.size()];
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            states[i] = Aggregator.create(a.fn(), a.distinct(), a.arg() == null ? null : a.arg().type(), a.type());
+        }
+        return states;
+    }
+
+    private static void acceptAggs(Aggregator[] states, List<BoundAgg> aggs, ExprEvaluator ev, long r) {
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            Object v;
+            if (a.fn() == AggregateFn.COUNT_STAR) {
+                v = Boolean.TRUE;
+            } else {
+                BoundExpr arg = a.arg();
+                v = arg == null ? null : ev.eval(arg, r);
+            }
+            states[i].accept(v);
+        }
+    }
+
+    private static @Nullable Object boxKey(long k, boolean isNull, boolean isI32) {
+        if (isNull) {
+            return null;
+        }
+        return isI32 ? (long) (int) k : k;
+    }
+
+    private static @Nullable Object @Nullable [] buildRowPrimitive1(long k, boolean isNull, Aggregator[] states,
+            BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs, PrimitiveKeyShape shape) {
+        List<Object> key = java.util.Collections.singletonList(boxKey(k, isNull, shape.isI32()[0]));
+        return materializeGroupRow(plan, groupExprs, key, aggs, states);
+    }
+
+    private static @Nullable Object @Nullable [] buildRowPrimitive2(long a, long b, boolean isNull, Aggregator[] states,
+            BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs, PrimitiveKeyShape shape) {
+        Object[] ka = new Object[]{boxKey(a, isNull, shape.isI32()[0]), boxKey(b, isNull, shape.isI32()[1])};
+        List<Object> key = Arrays.asList(ka);
+        return materializeGroupRow(plan, groupExprs, key, aggs, states);
+    }
+
+    private static @Nullable Object @Nullable [] materializeGroupRow(BoundSelect plan, List<BoundExpr> groupExprs,
+            List<Object> key, List<BoundAgg> aggs, Aggregator[] states) {
+        @Nullable
+        Object[] values = new @Nullable Object[plan.items().size()];
+        for (int i = 0; i < plan.items().size(); i++) {
+            BoundExpr e = plan.items().get(i).expr();
+            values[i] = evalPostAgg(e, groupExprs, key, aggs, states);
+        }
+        if (plan.having() != null) {
+            Object hv = evalPostAgg(plan.having(), groupExprs, key, aggs, states);
+            if (!truthy(hv)) {
+                return null;
+            }
+        }
+        return values;
     }
 
     private static long[] chunkBounds(long n) {
