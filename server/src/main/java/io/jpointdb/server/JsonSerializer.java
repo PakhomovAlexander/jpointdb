@@ -40,6 +40,10 @@ final class JsonSerializer {
     }
 
     static String queryResult(QueryResult r, long elapsedMs) {
+        return queryResult(r, elapsedMs, elapsedMs * 1_000_000L);
+    }
+
+    static String queryResult(QueryResult r, long elapsedMs, long elapsedNanos) {
         Map<String, Object> root = new LinkedHashMap<>();
         List<Object> cols = new ArrayList<>(r.columnCount());
         for (int i = 0; i < r.columnCount(); i++) {
@@ -59,6 +63,7 @@ final class JsonSerializer {
         root.put("rows", rows);
         root.put("rowCount", r.rowCount());
         root.put("elapsedMs", elapsedMs);
+        root.put("elapsedNanos", elapsedNanos);
         return Json.write(root);
     }
 

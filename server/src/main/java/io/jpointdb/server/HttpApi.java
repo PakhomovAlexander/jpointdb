@@ -39,8 +39,10 @@ final class HttpApi {
             long start = System.nanoTime();
             try {
                 QueryResult r = QueryEngine.run(table, sql);
-                long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-                respond(ex, 200, "application/json", JsonSerializer.queryResult(r, elapsedMs));
+                long elapsedNanos = System.nanoTime() - start;
+                long elapsedMs = elapsedNanos / 1_000_000;
+                respond(ex, 200, "application/json",
+                        JsonSerializer.queryResult(r, elapsedMs, elapsedNanos));
             } catch (SqlException e) {
                 respond(ex, 400, "application/json",
                         JsonSerializer.error(e.getMessage() == null ? "parse error" : e.getMessage()));
