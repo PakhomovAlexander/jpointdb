@@ -88,7 +88,15 @@ public final class Binder {
             case Binary b -> bindBinary(b);
             case FunctionCall f -> bindFunctionCall(f);
             case SqlAst.IsNull n -> new BoundIsNull(bindExpr(n.value()), n.negated());
-            case SqlAst.Like l -> new BoundLike(bindExpr(l.value()), bindExpr(l.pattern()), l.negated());
+            case SqlAst.Like l -> {
+                BoundExpr value = bindExpr(l.value());
+                BoundExpr pattern = bindExpr(l.pattern());
+                LikeMatcher matcher = null;
+                if (pattern instanceof BoundLiteral lit && lit.value() instanceof String pat) {
+                    matcher = LikeMatcher.forPattern(pat);
+                }
+                yield new BoundLike(value, pattern, l.negated(), matcher);
+            }
             case SqlAst.InList il -> {
                 BoundExpr v = bindExpr(il.value());
                 List<BoundExpr> items = new ArrayList<>();

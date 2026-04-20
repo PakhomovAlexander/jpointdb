@@ -200,12 +200,16 @@ public final class Executor {
             }
             case BoundLike l -> {
                 Object v = evalPostAgg(l.value(), groupExprs, key, aggs, states);
-                Object p = evalPostAgg(l.pattern(), groupExprs, key, aggs, states);
-                if (v == null || p == null)
+                if (v == null)
                     yield null;
-                boolean m = java.util.regex.Pattern
-                        .compile(ExprEvaluator.likeToRegex((String) p), java.util.regex.Pattern.DOTALL)
-                        .matcher((String) v).matches();
+                io.jpointdb.core.sql.LikeMatcher matcher = l.matcher();
+                if (matcher == null) {
+                    Object p = evalPostAgg(l.pattern(), groupExprs, key, aggs, states);
+                    if (p == null)
+                        yield null;
+                    matcher = io.jpointdb.core.sql.LikeMatcher.forPattern((String) p);
+                }
+                boolean m = matcher.matches((String) v);
                 yield l.negated() ? !m : m;
             }
             case BoundInList il -> {

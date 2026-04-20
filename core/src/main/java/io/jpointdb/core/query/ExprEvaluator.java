@@ -6,14 +6,13 @@ import io.jpointdb.core.column.I64Column;
 import io.jpointdb.core.column.StringColumn;
 import io.jpointdb.core.schema.ColumnType;
 import io.jpointdb.core.sql.BoundAst.*;
+import io.jpointdb.core.sql.LikeMatcher;
 import io.jpointdb.core.sql.SqlAst;
 import io.jpointdb.core.sql.SqlException;
 import io.jpointdb.core.sql.ValueType;
 import io.jpointdb.core.table.Table;
 import org.jspecify.annotations.Nullable;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
 
 /**
  * Row-at-a-time evaluator for {@link BoundExpr}. Returns boxed Java values:
@@ -235,72 +234,23 @@ public final class ExprEvaluator {
 
     private @Nullable Object evalLike(BoundLike l, long row) {
         Object v = eval(l.value(), row);
-        Object p = eval(l.pattern(), row);
-        if (v == null || p == null)
+        if (v == null)
             return null;
-        if (!(v instanceof String s) || !(p instanceof String pat)) {
+        if (!(v instanceof String s))
             throw new SqlException("LIKE requires string arguments", 0);
+        LikeMatcher matcher = l.matcher();
+        boolean m;
+        if (matcher != null) {
+            m = matcher.matches(s);
+        } else {
+            Object p = eval(l.pattern(), row);
+            if (p == null)
+                return null;
+            if (!(p instanceof String pat))
+                throw new SqlException("LIKE requires string arguments", 0);
+            m = LikeMatcher.forPattern(pat).matches(s);
         }
-        boolean m = likeMatcherFor(pat).matches(s);
         return l.negated() ? !m : m;
-    }
-
-    @FunctionalInterface
-    interface LikeMatcher {
-        boolean matches(String s);
-    }
-
-    private static final ConcurrentHashMap<String, LikeMatcher> LIKE_CACHE = new ConcurrentHashMap<>();
-
-    static LikeMatcher likeMatcherFor(String pat) {
-        LikeMatcher m = LIKE_CACHE.get(pat);
-        if (m != null)
-            return m;
-        return LIKE_CACHE.computeIfAbsent(pat, ExprEvaluator::buildLikeMatcher);
-    }
-
-    /**
-     * Builds the fastest matcher for a SQL LIKE pattern. Literal-only patterns
-     * (no wildcards → equals) and single-run {@code %}-delimited patterns with
-     * no {@code _} wildcard short-circuit into {@link String#contains},
-     * {@link String#startsWith}, or {@link String#endsWith} — each of which
-     * HotSpot lowers to a byte-level SIMD intrinsic on Latin-1 strings. Falls
-     * back to a compiled regex (one compile per distinct pattern, not per row).
-     */
-    private static LikeMatcher buildLikeMatcher(String pat) {
-        int len = pat.length();
-        boolean hasPct = false;
-        boolean hasUnderscore = false;
-        for (int i = 0; i < len; i++) {
-            char c = pat.charAt(i);
-            if (c == '%')
-                hasPct = true;
-            else if (c == '_')
-                hasUnderscore = true;
-        }
-        if (!hasPct && !hasUnderscore) {
-            return s -> s.equals(pat);
-        }
-        if (!hasUnderscore) {
-            int first = pat.indexOf('%');
-            int last = pat.lastIndexOf('%');
-            if (first == 0 && last == len - 1) {
-                String mid = pat.substring(1, len - 1);
-                if (mid.indexOf('%') < 0) {
-                    if (mid.isEmpty())
-                        return s -> true;
-                    return s -> s.contains(mid);
-                }
-            } else if (first == 0 && last == 0) {
-                String tail = pat.substring(1);
-                return s -> s.endsWith(tail);
-            } else if (first == len - 1 && last == len - 1) {
-                String head = pat.substring(0, len - 1);
-                return s -> s.startsWith(head);
-            }
-        }
-        Pattern p = Pattern.compile(likeToRegex(pat), Pattern.DOTALL);
-        return s -> p.matcher(s).matches();
     }
 
     private @Nullable Object evalInList(BoundInList il, long row) {
@@ -339,24 +289,6 @@ public final class ExprEvaluator {
         if (target == ValueType.F64 && v instanceof Integer i)
             return i.doubleValue();
         return v;
-    }
-
-    /**
-     * Convert SQL LIKE pattern to Java regex. {@code %} → {@code .*}, {@code _} →
-     * {@code .}
-     */
-    public static String likeToRegex(String pattern) {
-        StringBuilder sb = new StringBuilder(pattern.length() + 8);
-        for (int i = 0; i < pattern.length(); i++) {
-            char c = pattern.charAt(i);
-            switch (c) {
-                case '%' -> sb.append(".*");
-                case '_' -> sb.append('.');
-                case '.', '\\', '+', '*', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|' -> sb.append('\\').append(c);
-                default -> sb.append(c);
-            }
-        }
-        return sb.toString();
     }
 
     /** Materialize a column value as Java number for aggregators. */
