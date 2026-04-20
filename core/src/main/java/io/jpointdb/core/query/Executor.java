@@ -253,8 +253,12 @@ public final class Executor {
      * {@link I32Column} or {@link I64Column}. {@code width} is
      * {@code colIdx.length} (1 or 2).
      */
+    private enum KeyKind {
+        I32, I64, DICT_STRING
+    }
+
     @SuppressWarnings("ArrayRecordComponent")
-    private record PrimitiveKeyShape(int[] colIdx, boolean[] isI32) {
+    private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds) {
         int width() {
             return colIdx.length;
         }
@@ -266,22 +270,25 @@ public final class Executor {
             return null;
         }
         int[] cols = new int[w];
-        boolean[] isI32 = new boolean[w];
+        KeyKind[] kinds = new KeyKind[w];
         for (int i = 0; i < w; i++) {
             if (!(groupExprs.get(i) instanceof BoundColumn bc)) {
                 return null;
             }
             ColumnType t = table.columnMeta(bc.index()).type();
             if (t == ColumnType.I32) {
-                isI32[i] = true;
+                kinds[i] = KeyKind.I32;
             } else if (t == ColumnType.I64) {
-                isI32[i] = false;
+                kinds[i] = KeyKind.I64;
+            } else if (t == ColumnType.STRING
+                    && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                kinds[i] = KeyKind.DICT_STRING;
             } else {
                 return null;
             }
             cols[i] = bc.index();
         }
-        return new PrimitiveKeyShape(cols, isI32);
+        return new PrimitiveKeyShape(cols, kinds);
     }
 
     private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
@@ -318,19 +325,77 @@ public final class Executor {
 
         List<GroupEntry> groups = new ArrayList<>(merged.size());
         if (shape.width() == 1) {
-            merged.forEachKey1((k, isNull, states) -> groups.add(
-                    new GroupEntry(java.util.Collections.singletonList(boxKey(k, isNull, shape.isI32()[0])), states)));
+            merged.forEachKey1((k, isNull, states) -> groups.add(new GroupEntry(
+                    java.util.Collections.singletonList(boxKey(table, k, isNull, shape.colIdx()[0], shape.kinds()[0])),
+                    states)));
         } else {
             merged.forEachKey2((a, b, isNull, states) -> {
-                Object[] ka = new Object[]{boxKey(a, isNull, shape.isI32()[0]), boxKey(b, isNull, shape.isI32()[1])};
+                Object[] ka = new Object[]{boxKey(table, a, isNull, shape.colIdx()[0], shape.kinds()[0]),
+                        boxKey(table, b, isNull, shape.colIdx()[1], shape.kinds()[1])};
                 groups.add(new GroupEntry(Arrays.asList(ka), states));
             });
         }
         return finalizeAggregated(plan, groupExprs, aggs, groups);
     }
 
-    // NullAway can't see that only one of (i32_0, i64_0) / (i32_1, i64_1) is used at a time.
-    @SuppressWarnings("NullAway")
+    /**
+     * Reads one primitive long key per row. Instances capture the resolved column
+     * reader so the hot loop only sees two virtual calls and the JIT inlines them
+     * when the call site is monomorphic (it is — one reader per column position).
+     */
+    private interface LongKeyReader {
+        boolean isNullAt(long row);
+
+        long keyAt(long row);
+    }
+
+    private static LongKeyReader keyReader(Table table, int colIdx, KeyKind kind) {
+        return switch (kind) {
+            case I32 -> {
+                I32Column c = table.i32(colIdx);
+                yield new LongKeyReader() {
+                    @Override
+                    public boolean isNullAt(long row) {
+                        return c.isNullAt(row);
+                    }
+
+                    @Override
+                    public long keyAt(long row) {
+                        return c.get(row);
+                    }
+                };
+            }
+            case I64 -> {
+                I64Column c = table.i64(colIdx);
+                yield new LongKeyReader() {
+                    @Override
+                    public boolean isNullAt(long row) {
+                        return c.isNullAt(row);
+                    }
+
+                    @Override
+                    public long keyAt(long row) {
+                        return c.get(row);
+                    }
+                };
+            }
+            case DICT_STRING -> {
+                io.jpointdb.core.column.StringColumn c = table.string(colIdx);
+                yield new LongKeyReader() {
+                    @Override
+                    public boolean isNullAt(long row) {
+                        return c.isNullAt(row);
+                    }
+
+                    @Override
+                    public long keyAt(long row) {
+                        return c.idAt(row);
+                    }
+                };
+            }
+        };
+    }
+
     private static LongKeysAggMap scanAggChunkPrimitive(BoundSelect plan, Table table, List<BoundAgg> aggs,
             PrimitiveKeyShape shape, long from, long to) {
         ExprEvaluator ev = new ExprEvaluator(table);
@@ -341,10 +406,7 @@ public final class Executor {
         BoundExpr where = plan.where();
         LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
 
-        int col0 = shape.colIdx()[0];
-        boolean isI32A = shape.isI32()[0];
-        I32Column i32a = isI32A ? table.i32(col0) : null;
-        I64Column i64a = isI32A ? null : table.i64(col0);
+        LongKeyReader reader0 = keyReader(table, shape.colIdx()[0], shape.kinds()[0]);
 
         if (shape.width() == 1) {
             for (long r = from; r < to; r++) {
@@ -352,33 +414,21 @@ public final class Executor {
                     continue;
                 }
                 Aggregator[] states;
-                if (isI32A) {
-                    if (i32a.isNullAt(r)) {
-                        states = map.getOrCreateNull(factory);
-                    } else {
-                        states = map.getOrCreate1(i32a.get(r), factory);
-                    }
+                if (reader0.isNullAt(r)) {
+                    states = map.getOrCreateNull(factory);
                 } else {
-                    if (i64a.isNullAt(r)) {
-                        states = map.getOrCreateNull(factory);
-                    } else {
-                        states = map.getOrCreate1(i64a.get(r), factory);
-                    }
+                    states = map.getOrCreate1(reader0.keyAt(r), factory);
                 }
                 acceptAggs(states, aggs, ev, r);
             }
         } else {
-            int col1 = shape.colIdx()[1];
-            boolean isI32B = shape.isI32()[1];
-            I32Column i32b = isI32B ? table.i32(col1) : null;
-            I64Column i64b = isI32B ? null : table.i64(col1);
-
+            LongKeyReader reader1 = keyReader(table, shape.colIdx()[1], shape.kinds()[1]);
             for (long r = from; r < to; r++) {
                 if (where != null && !truthy(ev.eval(where, r))) {
                     continue;
                 }
-                boolean null0 = isI32A ? i32a.isNullAt(r) : i64a.isNullAt(r);
-                boolean null1 = isI32B ? i32b.isNullAt(r) : i64b.isNullAt(r);
+                boolean null0 = reader0.isNullAt(r);
+                boolean null1 = reader1.isNullAt(r);
                 Aggregator[] states;
                 if (null0 || null1) {
                     // Treat any-null composite as the null group. Matches three-valued
@@ -386,9 +436,7 @@ public final class Executor {
                     // no nulls in the grouped columns, and we preserve one-group-per-null.
                     states = map.getOrCreateNull(factory);
                 } else {
-                    long a = isI32A ? i32a.get(r) : i64a.get(r);
-                    long b = isI32B ? i32b.get(r) : i64b.get(r);
-                    states = map.getOrCreate2(a, b, factory);
+                    states = map.getOrCreate2(reader0.keyAt(r), reader1.keyAt(r), factory);
                 }
                 acceptAggs(states, aggs, ev, r);
             }
@@ -419,11 +467,21 @@ public final class Executor {
         }
     }
 
-    private static @Nullable Object boxKey(long k, boolean isNull, boolean isI32) {
+    private static @Nullable Object boxKey(Table table, long k, boolean isNull, int colIdx, KeyKind kind) {
         if (isNull) {
             return null;
         }
-        return isI32 ? (long) (int) k : k;
+        return switch (kind) {
+            case I32 -> (long) (int) k;
+            case I64 -> k;
+            case DICT_STRING -> {
+                io.jpointdb.core.column.Dictionary d = table.string(colIdx).dictionary();
+                if (d == null) {
+                    throw new IllegalStateException("DICT-encoded column " + colIdx + " has no dictionary");
+                }
+                yield d.stringAt((int) k);
+            }
+        };
     }
 
     // ---------- shared finalization: HAVING, ORDER BY, LIMIT, SELECT materialize ----------
