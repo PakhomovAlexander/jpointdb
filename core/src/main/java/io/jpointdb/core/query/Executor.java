@@ -13,52 +13,62 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 
 /**
  * Pull-based executor for MVP SQL: scalar SELECT, grand-total aggregates, GROUP
  * BY via hash map, ORDER BY via in-memory sort, LIMIT/OFFSET. Row-at-a-time;
- * vectorization comes later.
+ * vectorization comes later. Scans over large tables fan out to
+ * {@link ForkJoinPool#commonPool()} in equal-sized row chunks.
  */
 public final class Executor {
+
+    /** Split row range across threads when {@code rowCount >= this}. */
+    private static final long PARALLEL_THRESHOLD = 100_000L;
+    /** Each parallel chunk targets this many rows; clamped by core count. */
+    private static final long CHUNK_ROWS = 64_000L;
 
     private Executor() {
     }
 
     public static QueryResult execute(BoundSelect plan, Table table) {
-        ExprEvaluator ev = new ExprEvaluator(table);
         if (!plan.isAggregate() && plan.groupBy().isEmpty()) {
-            return executeScalar(plan, table, ev);
+            return executeScalar(plan, table);
         }
-        return executeAggregated(plan, table, ev);
+        return executeAggregated(plan, table);
     }
 
     // ---------- scalar ----------
 
-    private static QueryResult executeScalar(BoundSelect plan, Table table, ExprEvaluator ev) {
+    private static QueryResult executeScalar(BoundSelect plan, Table table) {
         long n = table.rowCount();
-        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
-        long offset = plan.offset() == null ? 0 : plan.offset();
         int orderCount = plan.orderBy().size();
 
-        List<@Nullable Object[]> values = new ArrayList<>();
-        List<@Nullable Object[]> sortKeys = orderCount == 0 ? null : new ArrayList<>();
-        for (long r = 0; r < n; r++) {
-            if (plan.where() != null && !truthy(ev.eval(plan.where(), r)))
-                continue;
-            @Nullable
-            Object[] v = new @Nullable Object[plan.items().size()];
-            for (int i = 0; i < plan.items().size(); i++) {
-                v[i] = ev.eval(plan.items().get(i).expr(), r);
+        ScalarChunk merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int k = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<ScalarChunk>[] tasks = new ForkJoinTask[k];
+            for (int c = 0; c < k; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool().submit(() -> scanScalarChunk(plan, table, from, to, orderCount));
             }
-            values.add(v);
-            if (sortKeys != null) {
-                @Nullable
-                Object[] k = new @Nullable Object[orderCount];
-                for (int i = 0; i < orderCount; i++)
-                    k[i] = ev.eval(plan.orderBy().get(i).expr(), r);
-                sortKeys.add(k);
+            merged = new ScalarChunk(new ArrayList<>(), orderCount == 0 ? null : new ArrayList<>());
+            for (ForkJoinTask<ScalarChunk> t : tasks) {
+                ScalarChunk r = t.join();
+                merged.values.addAll(r.values);
+                if (merged.sortKeys != null && r.sortKeys != null)
+                    merged.sortKeys.addAll(r.sortKeys);
             }
+        } else {
+            merged = scanScalarChunk(plan, table, 0, n, orderCount);
         }
+
+        List<@Nullable Object[]> values = merged.values;
+        List<@Nullable Object[]> sortKeys = merged.sortKeys;
         if (sortKeys != null) {
             boolean[] desc = new boolean[orderCount];
             for (int i = 0; i < orderCount; i++)
@@ -66,7 +76,7 @@ public final class Executor {
             Integer[] idx = new Integer[values.size()];
             for (int i = 0; i < idx.length; i++)
                 idx[i] = i;
-            java.util.Arrays.sort(idx, (a, b) -> {
+            Arrays.sort(idx, (a, b) -> {
                 @Nullable
                 Object[] ka = sortKeys.get(a);
                 @Nullable
@@ -83,73 +93,84 @@ public final class Executor {
                 ordered.add(values.get(i));
             values = ordered;
         }
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
         return toResult(plan, applyLimit(values, offset, limit));
+    }
+
+    private record ScalarChunk(List<@Nullable Object[]> values, @Nullable List<@Nullable Object[]> sortKeys) {
+    }
+
+    private static ScalarChunk scanScalarChunk(BoundSelect plan, Table table, long from, long to, int orderCount) {
+        ExprEvaluator ev = new ExprEvaluator(table);
+        List<@Nullable Object[]> values = new ArrayList<>();
+        List<@Nullable Object[]> sortKeys = orderCount == 0 ? null : new ArrayList<>();
+        BoundExpr where = plan.where();
+        List<BoundSelectItem> items = plan.items();
+        List<BoundOrderItem> orderBy = plan.orderBy();
+        for (long r = from; r < to; r++) {
+            if (where != null && !truthy(ev.eval(where, r)))
+                continue;
+            @Nullable
+            Object[] v = new @Nullable Object[items.size()];
+            for (int i = 0; i < items.size(); i++)
+                v[i] = ev.eval(items.get(i).expr(), r);
+            values.add(v);
+            if (sortKeys != null) {
+                @Nullable
+                Object[] k = new @Nullable Object[orderCount];
+                for (int i = 0; i < orderCount; i++)
+                    k[i] = ev.eval(orderBy.get(i).expr(), r);
+                sortKeys.add(k);
+            }
+        }
+        return new ScalarChunk(values, sortKeys);
     }
 
     // ---------- aggregate (GROUP BY or grand total) ----------
 
-    private static QueryResult executeAggregated(BoundSelect plan, Table table, ExprEvaluator ev) {
+    private static QueryResult executeAggregated(BoundSelect plan, Table table) {
         List<BoundExpr> groupExprs = plan.groupBy();
         List<BoundAgg> aggs = collectAggregates(plan);
-
-        // Build a map: group key → aggregator states (one per agg call).
-        Map<List<Object>, Aggregator[]> groups = new HashMap<>();
-        List<List<Object>> groupOrder = new ArrayList<>();
-        List<Object> scalarKey = List.of();
         long n = table.rowCount();
-        for (long r = 0; r < n; r++) {
-            if (plan.where() != null && !truthy(ev.eval(plan.where(), r)))
-                continue;
-            List<Object> key;
-            if (groupExprs.isEmpty()) {
-                key = scalarKey;
-            } else {
-                @Nullable
-                Object[] ka = new @Nullable Object[groupExprs.size()];
-                for (int i = 0; i < groupExprs.size(); i++)
-                    ka[i] = ev.eval(groupExprs.get(i), r);
-                key = Arrays.asList(ka);
+
+        AggChunk merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int k = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<AggChunk>[] tasks = new ForkJoinTask[k];
+            for (int c = 0; c < k; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] =
+                        ForkJoinPool.commonPool().submit(() -> scanAggChunk(plan, table, groupExprs, aggs, from, to));
             }
-            Aggregator[] states = groups.get(key);
-            if (states == null) {
-                states = new Aggregator[aggs.size()];
-                for (int i = 0; i < aggs.size(); i++) {
-                    BoundAgg a = aggs.get(i);
-                    states[i] =
-                            Aggregator.create(a.fn(), a.distinct(), a.arg() == null ? null : a.arg().type(), a.type());
-                }
-                groups.put(key, states);
-                groupOrder.add(key);
+            merged = new AggChunk(new HashMap<>(), new ArrayList<>());
+            for (ForkJoinTask<AggChunk> t : tasks) {
+                AggChunk r = t.join();
+                mergeAgg(merged, r, aggs);
             }
-            for (int i = 0; i < aggs.size(); i++) {
-                BoundAgg a = aggs.get(i);
-                Object v;
-                if (a.fn() == AggregateFn.COUNT_STAR) {
-                    v = Boolean.TRUE;
-                } else {
-                    BoundExpr arg = a.arg();
-                    v = arg == null ? null : ev.eval(arg, r);
-                }
-                states[i].accept(v);
-            }
+        } else {
+            merged = scanAggChunk(plan, table, groupExprs, aggs, 0, n);
         }
 
-        // If grand-total aggregate with zero rows, still emit one row.
-        if (groupExprs.isEmpty() && groupOrder.isEmpty()) {
+        // Grand total with zero matching rows → emit one row of empty states.
+        if (groupExprs.isEmpty() && merged.order.isEmpty()) {
             Aggregator[] states = new Aggregator[aggs.size()];
             for (int i = 0; i < aggs.size(); i++) {
                 BoundAgg a = aggs.get(i);
                 states[i] = Aggregator.create(a.fn(), a.distinct(), a.arg() == null ? null : a.arg().type(), a.type());
             }
-            groups.put(scalarKey, states);
-            groupOrder.add(scalarKey);
+            List<Object> scalarKey = List.of();
+            merged.groups.put(scalarKey, states);
+            merged.order.add(scalarKey);
         }
 
-        // Materialize a row per group: evaluate each select item, resolving agg calls
-        // to their computed state and group exprs to their key values.
+        // Materialize one row per group.
         List<@Nullable Object[]> rows = new ArrayList<>();
-        for (List<Object> key : groupOrder) {
-            Aggregator[] states = groups.get(key);
+        for (List<Object> key : merged.order) {
+            Aggregator[] states = merged.groups.get(key);
             if (states == null)
                 continue;
             @Nullable
@@ -173,6 +194,82 @@ public final class Executor {
         long offset = plan.offset() == null ? 0 : plan.offset();
         rows = applyLimit(rows, offset, limit);
         return toResult(plan, rows);
+    }
+
+    private record AggChunk(Map<List<Object>, Aggregator[]> groups, List<List<Object>> order) {
+    }
+
+    private static AggChunk scanAggChunk(BoundSelect plan, Table table, List<BoundExpr> groupExprs, List<BoundAgg> aggs,
+            long from, long to) {
+        ExprEvaluator ev = new ExprEvaluator(table);
+        Map<List<Object>, Aggregator[]> groups = new HashMap<>();
+        List<List<Object>> order = new ArrayList<>();
+        List<Object> scalarKey = List.of();
+        BoundExpr where = plan.where();
+        for (long r = from; r < to; r++) {
+            if (where != null && !truthy(ev.eval(where, r)))
+                continue;
+            List<Object> key;
+            if (groupExprs.isEmpty()) {
+                key = scalarKey;
+            } else {
+                @Nullable
+                Object[] ka = new @Nullable Object[groupExprs.size()];
+                for (int i = 0; i < groupExprs.size(); i++)
+                    ka[i] = ev.eval(groupExprs.get(i), r);
+                key = Arrays.asList(ka);
+            }
+            Aggregator[] states = groups.get(key);
+            if (states == null) {
+                states = new Aggregator[aggs.size()];
+                for (int i = 0; i < aggs.size(); i++) {
+                    BoundAgg a = aggs.get(i);
+                    states[i] =
+                            Aggregator.create(a.fn(), a.distinct(), a.arg() == null ? null : a.arg().type(), a.type());
+                }
+                groups.put(key, states);
+                order.add(key);
+            }
+            for (int i = 0; i < aggs.size(); i++) {
+                BoundAgg a = aggs.get(i);
+                Object v;
+                if (a.fn() == AggregateFn.COUNT_STAR) {
+                    v = Boolean.TRUE;
+                } else {
+                    BoundExpr arg = a.arg();
+                    v = arg == null ? null : ev.eval(arg, r);
+                }
+                states[i].accept(v);
+            }
+        }
+        return new AggChunk(groups, order);
+    }
+
+    private static void mergeAgg(AggChunk into, AggChunk from, List<BoundAgg> aggs) {
+        for (List<Object> key : from.order) {
+            Aggregator[] src = from.groups.get(key);
+            if (src == null)
+                continue;
+            Aggregator[] dst = into.groups.get(key);
+            if (dst == null) {
+                into.groups.put(key, src);
+                into.order.add(key);
+            } else {
+                for (int i = 0; i < aggs.size(); i++)
+                    dst[i].merge(src[i]);
+            }
+        }
+    }
+
+    private static long[] chunkBounds(long n) {
+        int byCores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int byRows = (int) Math.min(Integer.MAX_VALUE, (n + CHUNK_ROWS - 1) / CHUNK_ROWS);
+        int k = Math.max(1, Math.min(byCores * 2, byRows));
+        long chunk = (n + k - 1) / k;
+        long[] bounds = new long[k + 1];
+        for (int i = 0; i <= k; i++)
+            bounds[i] = Math.min(n, (long) i * chunk);
+        return bounds;
     }
 
     private static @Nullable Object evalPostAgg(BoundExpr e, List<BoundExpr> groupExprs, List<Object> key,

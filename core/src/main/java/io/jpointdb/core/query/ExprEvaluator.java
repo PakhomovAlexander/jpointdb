@@ -13,7 +13,6 @@ import io.jpointdb.core.sql.ValueType;
 import io.jpointdb.core.table.Table;
 import org.jspecify.annotations.Nullable;
 
-
 /**
  * Row-at-a-time evaluator for {@link BoundExpr}. Returns boxed Java values:
  * Long for I32/I64, Double for F64, String for STRING, Boolean for BOOL, null

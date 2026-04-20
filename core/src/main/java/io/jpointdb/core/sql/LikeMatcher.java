@@ -7,7 +7,8 @@ import java.util.regex.Pattern;
  * Compiled matcher for a SQL LIKE pattern. Built once per distinct pattern
  * string and reused across rows.
  *
- * <p>For literal-only patterns ({@code literal}, {@code literal%},
+ * <p>
+ * For literal-only patterns ({@code literal}, {@code literal%},
  * {@code %literal}, {@code %literal%}, with no {@code _} wildcards and no
  * embedded {@code %}), the matcher reduces to {@link String#equals},
  * {@link String#startsWith}, {@link String#endsWith}, or
@@ -75,8 +76,7 @@ public interface LikeMatcher {
             switch (c) {
                 case '%' -> sb.append(".*");
                 case '_' -> sb.append('.');
-                case '.', '\\', '+', '*', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|' ->
-                        sb.append('\\').append(c);
+                case '.', '\\', '+', '*', '?', '(', ')', '[', ']', '{', '}', '^', '$', '|' -> sb.append('\\').append(c);
                 default -> sb.append(c);
             }
         }

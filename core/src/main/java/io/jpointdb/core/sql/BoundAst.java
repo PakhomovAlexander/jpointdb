@@ -65,9 +65,8 @@ public final class BoundAst {
     }
 
     /**
-     * {@code matcher} is non-null when {@code pattern} was a literal at bind
-     * time — that's every real SQL query — so the executor skips the per-row
-     * cache lookup.
+     * {@code matcher} is non-null when {@code pattern} was a literal at bind time —
+     * that's every real SQL query — so the executor skips the per-row cache lookup.
      */
     public record BoundLike(BoundExpr value, BoundExpr pattern, boolean negated,
             @Nullable LikeMatcher matcher) implements BoundExpr {

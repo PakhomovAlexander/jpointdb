@@ -9,10 +9,14 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * Mutable accumulator for a single aggregate call. One instance per group.
+ * {@link #merge} combines another accumulator of the same shape — used by the
+ * parallel executor to fold per-chunk states back into one result.
  */
 abstract class Aggregator {
 
     abstract void accept(@Nullable Object value);
+
+    abstract void merge(Aggregator other);
 
     abstract @Nullable Object result();
 
@@ -38,6 +42,10 @@ abstract class Aggregator {
             count++;
         }
         @Override
+        void merge(Aggregator other) {
+            count += ((CountStar) other).count;
+        }
+        @Override
         @Nullable
         Object result() {
             return count;
@@ -50,6 +58,10 @@ abstract class Aggregator {
         void accept(@Nullable Object value) {
             if (value != null)
                 count++;
+        }
+        @Override
+        void merge(Aggregator other) {
+            count += ((Count) other).count;
         }
         @Override
         @Nullable
@@ -69,6 +81,12 @@ abstract class Aggregator {
             sum += ((Number) value).longValue();
         }
         @Override
+        void merge(Aggregator other) {
+            SumLong o = (SumLong) other;
+            sum += o.sum;
+            any |= o.any;
+        }
+        @Override
         @Nullable
         Object result() {
             return any ? sum : null;
@@ -86,6 +104,12 @@ abstract class Aggregator {
             sum += ((Number) value).doubleValue();
         }
         @Override
+        void merge(Aggregator other) {
+            SumDouble o = (SumDouble) other;
+            sum += o.sum;
+            any |= o.any;
+        }
+        @Override
         @Nullable
         Object result() {
             return any ? sum : null;
@@ -101,6 +125,12 @@ abstract class Aggregator {
                 return;
             count++;
             sum += ((Number) value).doubleValue();
+        }
+        @Override
+        void merge(Aggregator other) {
+            Avg o = (Avg) other;
+            sum += o.sum;
+            count += o.count;
         }
         @Override
         @Nullable
@@ -129,6 +159,12 @@ abstract class Aggregator {
                 best = value;
         }
         @Override
+        void merge(Aggregator other) {
+            MinMax o = (MinMax) other;
+            if (o.best != null)
+                accept(o.best);
+        }
+        @Override
         @Nullable
         Object result() {
             return best;
@@ -147,6 +183,14 @@ abstract class Aggregator {
                 return;
             if (seen.add(value))
                 inner.accept(value);
+        }
+        @Override
+        void merge(Aggregator other) {
+            Distinct o = (Distinct) other;
+            for (Object v : o.seen) {
+                if (seen.add(v))
+                    inner.accept(v);
+            }
         }
         @Override
         @Nullable

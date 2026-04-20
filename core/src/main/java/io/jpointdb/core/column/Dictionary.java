@@ -102,8 +102,8 @@ public final class Dictionary implements AutoCloseable {
     }
 
     /**
-     * Returns the cached {@link String} for {@code id}, decoding it from
-     * UTF-8 on the first access. Subsequent reads skip allocation entirely.
+     * Returns the cached {@link String} for {@code id}, decoding it from UTF-8 on
+     * the first access. Subsequent reads skip allocation entirely.
      */
     public String stringAt(int id) {
         String s = stringCache[id];

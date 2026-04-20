@@ -104,21 +104,20 @@ class QueryEngineTest {
 
     @Test
     void likeShapes(@TempDir Path dir) throws IOException {
-        try (Table t = convertAndOpen(dir,
-                "abc\nabcdef\nxyzabc\nexact\nfoo_bar\n", List.of("s"))) {
+        try (Table t = convertAndOpen(dir, "abc\nabcdef\nxyzabc\nexact\nfoo_bar\n", List.of("s"))) {
             String table = tableName(t);
-            assertEquals(1L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'exact'")
-                    .rows().get(0)[0]);
-            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'abc%'")
-                    .rows().get(0)[0]);
-            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc'")
-                    .rows().get(0)[0]);
-            assertEquals(3L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc%'")
-                    .rows().get(0)[0]);
-            assertEquals(1L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'foo_bar'")
-                    .rows().get(0)[0]);
-            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s NOT LIKE '%abc%'")
-                    .rows().get(0)[0]);
+            assertEquals(1L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'exact'").rows().get(0)[0]);
+            assertEquals(2L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'abc%'").rows().get(0)[0]);
+            assertEquals(2L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc'").rows().get(0)[0]);
+            assertEquals(3L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE '%abc%'").rows().get(0)[0]);
+            assertEquals(1L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s LIKE 'foo_bar'").rows().get(0)[0]);
+            assertEquals(2L,
+                    QueryEngine.run(t, "SELECT COUNT(*) FROM " + table + " WHERE s NOT LIKE '%abc%'").rows().get(0)[0]);
         }
     }
 
