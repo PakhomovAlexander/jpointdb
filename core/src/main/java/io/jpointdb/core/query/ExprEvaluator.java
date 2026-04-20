@@ -25,8 +25,21 @@ public final class ExprEvaluator {
 
     private final Table table;
 
+    // Per-row cache keyed by column index. colCacheRow[i] == current row if the
+    // value for column i has already been read this row (primitive sentinel for
+    // "not cached" is Long.MIN_VALUE, which is never a real row id). Skips
+    // re-decoding the same column when a query reads it many times per row —
+    // e.g. Q30's 90 SUMs over ResolutionWidth.
+    private final long[] colCacheRow;
+    private final @Nullable Object[] colCacheVal;
+    private static final long NOT_CACHED = Long.MIN_VALUE;
+
     public ExprEvaluator(Table table) {
         this.table = table;
+        int n = table.columnCount();
+        this.colCacheRow = new long[n];
+        this.colCacheVal = new @Nullable Object[n];
+        java.util.Arrays.fill(this.colCacheRow, NOT_CACHED);
     }
 
     public @Nullable Object eval(BoundExpr e, long row) {
@@ -87,8 +100,11 @@ public final class ExprEvaluator {
     }
 
     private @Nullable Object readColumn(int idx, long row) {
+        if (colCacheRow[idx] == row) {
+            return colCacheVal[idx];
+        }
         ColumnType t = table.columnMeta(idx).type();
-        return switch (t) {
+        Object v = switch (t) {
             case I32 -> {
                 I32Column c = table.i32(idx);
                 yield c.isNullAt(row) ? null : (long) c.get(row);
@@ -106,6 +122,9 @@ public final class ExprEvaluator {
                 yield c.isNullAt(row) ? null : c.valueAsString(row);
             }
         };
+        colCacheRow[idx] = row;
+        colCacheVal[idx] = v;
+        return v;
     }
 
     private @Nullable Object evalUnary(BoundUnary u, long row) {
