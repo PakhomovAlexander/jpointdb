@@ -165,43 +165,19 @@ public final class Executor {
 
         // Grand total with zero matching rows → emit one row of empty states.
         if (groupExprs.isEmpty() && merged.order.isEmpty()) {
-            Aggregator[] states = new Aggregator[aggs.size()];
-            for (int i = 0; i < aggs.size(); i++) {
-                BoundAgg a = aggs.get(i);
-                states[i] = Aggregator.create(a.fn(), a.distinct(), a.arg() == null ? null : a.arg().type(), a.type());
-            }
+            Aggregator[] states = createStates(aggs);
             List<Object> scalarKey = List.of();
             merged.groups.put(scalarKey, states);
             merged.order.add(scalarKey);
         }
 
-        // Materialize one row per group.
-        List<@Nullable Object[]> rows = new ArrayList<>();
+        List<GroupEntry> groups = new ArrayList<>(merged.order.size());
         for (List<Object> key : merged.order) {
             Aggregator[] states = merged.groups.get(key);
-            if (states == null)
-                continue;
-            @Nullable
-            Object[] values = new @Nullable Object[plan.items().size()];
-            for (int i = 0; i < plan.items().size(); i++) {
-                BoundExpr e = plan.items().get(i).expr();
-                values[i] = evalPostAgg(e, groupExprs, key, aggs, states);
-            }
-            if (plan.having() != null) {
-                Object hv = evalPostAgg(plan.having(), groupExprs, key, aggs, states);
-                if (!truthy(hv))
-                    continue;
-            }
-            rows.add(values);
+            if (states != null)
+                groups.add(new GroupEntry(key, states));
         }
-
-        if (!plan.orderBy().isEmpty())
-            rows = sortAggregated(rows, plan, groupExprs, aggs);
-
-        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
-        long offset = plan.offset() == null ? 0 : plan.offset();
-        rows = applyLimit(rows, offset, limit);
-        return toResult(plan, rows);
+        return finalizeAggregated(plan, groupExprs, aggs, groups);
     }
 
     private record AggChunk(Map<List<Object>, Aggregator[]> groups, List<List<Object>> order) {
@@ -330,36 +306,17 @@ public final class Executor {
             merged = scanAggChunkPrimitive(plan, table, aggs, shape, 0, n);
         }
 
-        // Materialize rows. Build the boxed key on a per-group basis so evalPostAgg stays unchanged.
-        List<@Nullable Object[]> rows = new ArrayList<>();
-        List<BoundSelectItem> items = plan.items();
-        BoundExpr having = plan.having();
+        List<GroupEntry> groups = new ArrayList<>(merged.size());
         if (shape.width() == 1) {
-            merged.forEachKey1((k, isNull, states) -> {
-                @Nullable
-                Object[] row = buildRowPrimitive1(k, isNull, states, plan, groupExprs, aggs, shape);
-                if (row != null) {
-                    rows.add(row);
-                }
-            });
+            merged.forEachKey1((k, isNull, states) -> groups.add(
+                    new GroupEntry(java.util.Collections.singletonList(boxKey(k, isNull, shape.isI32()[0])), states)));
         } else {
             merged.forEachKey2((a, b, isNull, states) -> {
-                @Nullable
-                Object[] row = buildRowPrimitive2(a, b, isNull, states, plan, groupExprs, aggs, shape);
-                if (row != null) {
-                    rows.add(row);
-                }
+                Object[] ka = new Object[]{boxKey(a, isNull, shape.isI32()[0]), boxKey(b, isNull, shape.isI32()[1])};
+                groups.add(new GroupEntry(Arrays.asList(ka), states));
             });
         }
-
-        List<@Nullable Object[]> out = rows;
-        if (!plan.orderBy().isEmpty()) {
-            out = sortAggregated(out, plan, groupExprs, aggs);
-        }
-        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
-        long offset = plan.offset() == null ? 0 : plan.offset();
-        out = applyLimit(out, offset, limit);
-        return toResult(plan, out);
+        return finalizeAggregated(plan, groupExprs, aggs, groups);
     }
 
     // NullAway can't see that only one of (i32_0, i64_0) / (i32_1, i64_1) is used at a time.
@@ -456,34 +413,127 @@ public final class Executor {
         return isI32 ? (long) (int) k : k;
     }
 
-    private static @Nullable Object @Nullable [] buildRowPrimitive1(long k, boolean isNull, Aggregator[] states,
-            BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs, PrimitiveKeyShape shape) {
-        List<Object> key = java.util.Collections.singletonList(boxKey(k, isNull, shape.isI32()[0]));
-        return materializeGroupRow(plan, groupExprs, key, aggs, states);
+    // ---------- shared finalization: HAVING, ORDER BY, LIMIT, SELECT materialize ----------
+
+    /**
+     * A group after aggregation, before HAVING/ORDER BY/LIMIT/SELECT evaluation.
+     */
+    private record GroupEntry(List<Object> key, Aggregator[] states) {
     }
 
-    private static @Nullable Object @Nullable [] buildRowPrimitive2(long a, long b, boolean isNull, Aggregator[] states,
-            BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs, PrimitiveKeyShape shape) {
-        Object[] ka = new Object[]{boxKey(a, isNull, shape.isI32()[0]), boxKey(b, isNull, shape.isI32()[1])};
-        List<Object> key = Arrays.asList(ka);
-        return materializeGroupRow(plan, groupExprs, key, aggs, states);
-    }
+    /**
+     * Applies HAVING, ORDER BY, LIMIT/OFFSET and materializes the SELECT list.
+     * Defers per-group SELECT evaluation until we know which groups survive
+     * {@code offset + limit} — for high-cardinality GROUP BY with a small LIMIT
+     * (e.g. Q33's 1M groups, LIMIT 10) this skips ~999k wasted evaluations.
+     */
+    private static QueryResult finalizeAggregated(BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs,
+            List<GroupEntry> groups) {
+        BoundExpr having = plan.having();
+        List<BoundOrderItem> orderBy = plan.orderBy();
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
 
-    private static @Nullable Object @Nullable [] materializeGroupRow(BoundSelect plan, List<BoundExpr> groupExprs,
-            List<Object> key, List<BoundAgg> aggs, Aggregator[] states) {
-        @Nullable
-        Object[] values = new @Nullable Object[plan.items().size()];
-        for (int i = 0; i < plan.items().size(); i++) {
-            BoundExpr e = plan.items().get(i).expr();
-            values[i] = evalPostAgg(e, groupExprs, key, aggs, states);
+        // HAVING filter + ORDER BY value extraction per group. ORDER BY values are
+        // per-group, so this is O(groups × orderBy.size()) — cheap compared to the
+        // full SELECT materialize we defer until after LIMIT.
+        int orderN = orderBy.size();
+        List<PendingGroup> pending = new ArrayList<>(groups.size());
+        for (GroupEntry g : groups) {
+            if (having != null) {
+                Object hv = evalPostAgg(having, groupExprs, g.key(), aggs, g.states());
+                if (!truthy(hv)) {
+                    continue;
+                }
+            }
+            @Nullable
+            Object[] orderVals = orderN == 0 ? EMPTY_OBJECTS : new @Nullable Object[orderN];
+            for (int i = 0; i < orderN; i++) {
+                orderVals[i] = evalPostAgg(orderBy.get(i).expr(), groupExprs, g.key(), aggs, g.states());
+            }
+            pending.add(new PendingGroup(g.key(), g.states(), orderVals));
         }
-        if (plan.having() != null) {
-            Object hv = evalPostAgg(plan.having(), groupExprs, key, aggs, states);
-            if (!truthy(hv)) {
-                return null;
+
+        List<PendingGroup> ordered;
+        if (orderN > 0) {
+            Comparator<PendingGroup> cmp = orderComparator(orderBy);
+            long bound = Math.min((long) Integer.MAX_VALUE, offset + Math.min(limit, Integer.MAX_VALUE - offset));
+            int k = (int) Math.min(pending.size(), Math.max(0L, bound));
+            if (k < pending.size() && k < pending.size() / 2L) {
+                ordered = selectTopK(pending, cmp, k);
+            } else {
+                ordered = new ArrayList<>(pending);
+                ordered.sort(cmp);
+            }
+        } else {
+            ordered = pending;
+        }
+
+        int fromIdx = (int) Math.min((long) ordered.size(), offset);
+        int toIdx = (int) Math.min((long) ordered.size(), fromIdx + Math.min(limit, Integer.MAX_VALUE - fromIdx));
+        List<PendingGroup> winners = ordered.subList(fromIdx, toIdx);
+
+        List<@Nullable Object[]> rows = new ArrayList<>(winners.size());
+        List<BoundSelectItem> items = plan.items();
+        for (PendingGroup pg : winners) {
+            @Nullable
+            Object[] row = new @Nullable Object[items.size()];
+            for (int i = 0; i < items.size(); i++) {
+                row[i] = evalPostAgg(items.get(i).expr(), groupExprs, pg.key(), aggs, pg.states());
+            }
+            rows.add(row);
+        }
+        return toResult(plan, rows);
+    }
+
+    private record PendingGroup(List<Object> key, Aggregator[] states, @Nullable Object[] orderVals) {
+    }
+
+    private static final Object[] EMPTY_OBJECTS = new Object[0];
+
+    private static Comparator<PendingGroup> orderComparator(List<BoundOrderItem> orderBy) {
+        return (ga, gb) -> {
+            @Nullable
+            Object[] a = ga.orderVals();
+            @Nullable
+            Object[] b = gb.orderVals();
+            for (int i = 0; i < orderBy.size(); i++) {
+                int c = compareNullsLast(a[i], b[i]);
+                if (c != 0) {
+                    return orderBy.get(i).direction() == SqlAst.SortDirection.DESC ? -c : c;
+                }
+            }
+            return 0;
+        };
+    }
+
+    /**
+     * Returns the top {@code k} elements by {@code cmp} (lowest-cmp first in the
+     * returned list), using a bounded min-heap of capacity {@code k}. Heap is
+     * ordered by {@code cmp.reversed()} so the root is the current worst survivor;
+     * we evict it when a better candidate arrives.
+     */
+    private static <T> List<T> selectTopK(List<T> input, Comparator<T> cmp, int k) {
+        if (k <= 0) {
+            return new ArrayList<>();
+        }
+        if (k >= input.size()) {
+            List<T> copy = new ArrayList<>(input);
+            copy.sort(cmp);
+            return copy;
+        }
+        java.util.PriorityQueue<T> heap = new java.util.PriorityQueue<>(k, cmp.reversed());
+        for (T el : input) {
+            if (heap.size() < k) {
+                heap.add(el);
+            } else if (cmp.compare(el, heap.peek()) < 0) {
+                heap.poll();
+                heap.add(el);
             }
         }
-        return values;
+        List<T> result = new ArrayList<>(heap);
+        result.sort(cmp);
+        return result;
     }
 
     private static long[] chunkBounds(long n) {
@@ -743,44 +793,6 @@ public final class Executor {
             types.add(it.expr().type());
         }
         return new QueryResult(names, types, rows);
-    }
-
-    private static List<@Nullable Object[]> sortAggregated(List<@Nullable Object[]> rows, BoundSelect plan,
-            List<BoundExpr> groupExprs, List<BoundAgg> aggs) {
-        List<BoundOrderItem> order = plan.orderBy();
-        // Build resolver for each order expression: find it among select items (by expr equality) to get its index.
-        int[] colIdx = new int[order.size()];
-        boolean[] descs = new boolean[order.size()];
-        for (int i = 0; i < order.size(); i++) {
-            BoundOrderItem o = order.get(i);
-            descs[i] = o.direction() == SqlAst.SortDirection.DESC;
-            int idx = findSelectItemIndex(plan.items(), o.expr());
-            if (idx < 0) {
-                throw new SqlException("ORDER BY expression not found in SELECT list (yet unsupported)", 0);
-            }
-            colIdx[i] = idx;
-        }
-        Comparator<Object[]> cmp = (a, b) -> {
-            for (int i = 0; i < colIdx.length; i++) {
-                Object va = a[colIdx[i]];
-                Object vb = b[colIdx[i]];
-                int c = compareNullsLast(va, vb);
-                if (c != 0)
-                    return descs[i] ? -c : c;
-            }
-            return 0;
-        };
-        List<@Nullable Object[]> copy = new ArrayList<>(rows);
-        copy.sort(cmp);
-        return copy;
-    }
-
-    private static int findSelectItemIndex(List<BoundSelectItem> items, BoundExpr e) {
-        for (int i = 0; i < items.size(); i++) {
-            if (exprEquals(items.get(i).expr(), e))
-                return i;
-        }
-        return -1;
     }
 
     private static int compareNullsLast(@Nullable Object a, @Nullable Object b) {

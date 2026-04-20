@@ -185,6 +185,7 @@ subprojects {
 
     tasks.withType<Test>().configureEach {
         useJUnitPlatform()
+        maxHeapSize = "2g"
         jvmArgs(
             "--add-modules=jdk.incubator.vector",
             "--enable-native-access=ALL-UNNAMED",
