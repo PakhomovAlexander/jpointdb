@@ -130,10 +130,22 @@ public final class ExprEvaluator {
     }
 
     private @Nullable Object evalBinary(BoundBinary b, long row) {
-        if (b.op() == SqlAst.BinaryOp.AND)
-            return andOp(eval(b.left(), row), eval(b.right(), row));
-        if (b.op() == SqlAst.BinaryOp.OR)
-            return orOp(eval(b.left(), row), eval(b.right(), row));
+        if (b.op() == SqlAst.BinaryOp.AND) {
+            Object l = eval(b.left(), row);
+            // SQL three-valued AND: FALSE short-circuits to FALSE even if
+            // right is NULL; otherwise we must evaluate right.
+            if (Boolean.FALSE.equals(l))
+                return Boolean.FALSE;
+            Object r = eval(b.right(), row);
+            return andOp(l, r);
+        }
+        if (b.op() == SqlAst.BinaryOp.OR) {
+            Object l = eval(b.left(), row);
+            if (Boolean.TRUE.equals(l))
+                return Boolean.TRUE;
+            Object r = eval(b.right(), row);
+            return orOp(l, r);
+        }
         Object l = eval(b.left(), row);
         Object r = eval(b.right(), row);
         if (l == null || r == null)
