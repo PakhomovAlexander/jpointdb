@@ -39,8 +39,10 @@ final class LongKeysAggMap {
     private int mask;
     private int size;
 
-    private long[] orderKeys;
-    private int orderSize;
+    // occupiedSlots[0..size) lists the slot indices of non-empty entries in
+    // insertion order. Iteration (forEachKey / merge) reads this directly —
+    // no re-probe, no hash recompute, no scanning past empty slots.
+    private int[] occupiedSlots;
 
     private boolean hasNull;
     private Aggregator[] nullStates;
@@ -60,7 +62,7 @@ final class LongKeysAggMap {
             cap <<= 1;
         }
         init(cap);
-        orderKeys = new long[Math.max(16 * width, capacityHint * width)];
+        occupiedSlots = new int[Math.max(16, capacityHint)];
     }
 
     private void init(int cap) {
@@ -69,6 +71,15 @@ final class LongKeysAggMap {
         keys = new long[cap * width];
         values = new Aggregator[cap][];
         size = 0;
+    }
+
+    private void recordSlot(int slot) {
+        if (size == occupiedSlots.length) {
+            int[] grown = new int[occupiedSlots.length * 2];
+            System.arraycopy(occupiedSlots, 0, grown, 0, occupiedSlots.length);
+            occupiedSlots = grown;
+        }
+        occupiedSlots[size] = slot;
     }
 
     int size() {
@@ -84,8 +95,8 @@ final class LongKeysAggMap {
             keys[slot] = k;
             v = f.create();
             values[slot] = v;
+            recordSlot(slot);
             size++;
-            appendOrder1(k);
             if (size >= (int) (capacity * LOAD)) {
                 rehash();
             }
@@ -101,19 +112,14 @@ final class LongKeysAggMap {
         return slot;
     }
 
-    private void appendOrder1(long k) {
-        if (orderSize == orderKeys.length) {
-            long[] grown = new long[orderKeys.length * 2];
-            System.arraycopy(orderKeys, 0, grown, 0, orderKeys.length);
-            orderKeys = grown;
-        }
-        orderKeys[orderSize++] = k;
-    }
-
     void forEachKey1(Visitor1 v) {
-        for (int i = 0; i < orderSize; i++) {
-            long k = orderKeys[i];
-            v.visit(k, false, values[probe1(k)]);
+        int[] slots = occupiedSlots;
+        long[] ks = keys;
+        Aggregator[][] vals = values;
+        int n = size;
+        for (int i = 0; i < n; i++) {
+            int slot = slots[i];
+            v.visit(ks[slot], false, vals[slot]);
         }
         if (hasNull) {
             v.visit(0L, true, nullStates);
@@ -130,8 +136,8 @@ final class LongKeysAggMap {
             keys[slot * 2 + 1] = b;
             v = f.create();
             values[slot] = v;
+            recordSlot(slot);
             size++;
-            appendOrder2(a, b);
             if (size >= (int) (capacity * LOAD)) {
                 rehash();
             }
@@ -147,22 +153,14 @@ final class LongKeysAggMap {
         return slot;
     }
 
-    private void appendOrder2(long a, long b) {
-        if (orderSize * 2 >= orderKeys.length) {
-            long[] grown = new long[orderKeys.length * 2];
-            System.arraycopy(orderKeys, 0, grown, 0, orderKeys.length);
-            orderKeys = grown;
-        }
-        orderKeys[orderSize * 2] = a;
-        orderKeys[orderSize * 2 + 1] = b;
-        orderSize++;
-    }
-
     void forEachKey2(Visitor2 v) {
-        for (int i = 0; i < orderSize; i++) {
-            long a = orderKeys[i * 2];
-            long b = orderKeys[i * 2 + 1];
-            v.visit(a, b, false, values[probe2(a, b)]);
+        int[] slots = occupiedSlots;
+        long[] ks = keys;
+        Aggregator[][] vals = values;
+        int n = size;
+        for (int i = 0; i < n; i++) {
+            int slot = slots[i];
+            v.visit(ks[slot * 2], ks[slot * 2 + 1], false, vals[slot]);
         }
         if (hasNull) {
             v.visit(0L, 0L, true, nullStates);
@@ -195,17 +193,22 @@ final class LongKeysAggMap {
                 }
             }
         }
+        int[] otherSlots = other.occupiedSlots;
+        Aggregator[][] otherVals = other.values;
+        long[] otherKeys = other.keys;
+        int n = other.size;
         if (width == 1) {
-            for (int i = 0; i < other.orderSize; i++) {
-                long k = other.orderKeys[i];
-                Aggregator[] src = other.values[other.probe1(k)];
+            for (int i = 0; i < n; i++) {
+                int oslot = otherSlots[i];
+                Aggregator[] src = otherVals[oslot];
+                long k = otherKeys[oslot];
                 int slot = probe1(k);
                 Aggregator[] dst = values[slot];
                 if (dst == null) {
                     keys[slot] = k;
                     values[slot] = src;
+                    recordSlot(slot);
                     size++;
-                    appendOrder1(k);
                     if (size >= (int) (capacity * LOAD)) {
                         rehash();
                     }
@@ -216,18 +219,19 @@ final class LongKeysAggMap {
                 }
             }
         } else {
-            for (int i = 0; i < other.orderSize; i++) {
-                long a = other.orderKeys[i * 2];
-                long b = other.orderKeys[i * 2 + 1];
-                Aggregator[] src = other.values[other.probe2(a, b)];
+            for (int i = 0; i < n; i++) {
+                int oslot = otherSlots[i];
+                Aggregator[] src = otherVals[oslot];
+                long a = otherKeys[oslot * 2];
+                long b = otherKeys[oslot * 2 + 1];
                 int slot = probe2(a, b);
                 Aggregator[] dst = values[slot];
                 if (dst == null) {
                     keys[slot * 2] = a;
                     keys[slot * 2 + 1] = b;
                     values[slot] = src;
+                    recordSlot(slot);
                     size++;
-                    appendOrder2(a, b);
                     if (size >= (int) (capacity * LOAD)) {
                         rehash();
                     }
@@ -245,40 +249,41 @@ final class LongKeysAggMap {
     private void rehash() {
         long[] oldKeys = keys;
         Aggregator[][] oldValues = values;
-        int oldCap = capacity;
+        int[] oldSlots = occupiedSlots;
         int oldSize = size;
         init(capacity * 2);
+        // Walk oldSlots in insertion order so occupiedSlots stays in the same
+        // insertion order after the rehash.
         if (width == 1) {
-            for (int i = 0; i < oldCap; i++) {
-                Aggregator[] v = oldValues[i];
-                if (v == null) {
-                    continue;
-                }
-                long k = oldKeys[i];
+            for (int i = 0; i < oldSize; i++) {
+                int srcSlot = oldSlots[i];
+                long k = oldKeys[srcSlot];
                 int slot = (int) (mix(k) & mask);
                 while (values[slot] != null) {
                     slot = (slot + 1) & mask;
                 }
                 keys[slot] = k;
-                values[slot] = v;
+                values[slot] = oldValues[srcSlot];
+                oldSlots[i] = slot; // reuse the array as new occupiedSlots
             }
         } else {
-            for (int i = 0; i < oldCap; i++) {
-                Aggregator[] v = oldValues[i];
-                if (v == null) {
-                    continue;
-                }
-                long a = oldKeys[i * 2];
-                long b = oldKeys[i * 2 + 1];
+            for (int i = 0; i < oldSize; i++) {
+                int srcSlot = oldSlots[i];
+                long a = oldKeys[srcSlot * 2];
+                long b = oldKeys[srcSlot * 2 + 1];
                 int slot = (int) (mix2(a, b) & mask);
                 while (values[slot] != null) {
                     slot = (slot + 1) & mask;
                 }
                 keys[slot * 2] = a;
                 keys[slot * 2 + 1] = b;
-                values[slot] = v;
+                values[slot] = oldValues[srcSlot];
+                oldSlots[i] = slot;
             }
         }
+        // Keep the old occupiedSlots array (it's been updated in place and may
+        // still have capacity for more inserts).
+        occupiedSlots = oldSlots;
         size = oldSize;
     }
 
