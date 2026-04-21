@@ -557,6 +557,65 @@ public final class Executor {
         };
     }
 
+    /** Consumes a row's aggregate input into a per-group Aggregator state. */
+    private interface PrimAggAccept {
+        void acceptRow(Aggregator state, long row);
+    }
+
+    /**
+     * If every agg's argument is a plain I32 / I64 / F64 column (or COUNT_STAR),
+     * returns one-per-agg primitive-accept routines that call
+     * {@link Aggregator#acceptLong} / {@link Aggregator#acceptDouble} directly,
+     * skipping the Long.valueOf / Number.longValue boxing round-trip. Returns
+     * {@code null} to signal "fall back to the generic boxed path" when any agg has
+     * an expression argument we can't cheaply specialize.
+     */
+    private static PrimAggAccept @Nullable [] resolvePrimitiveArgAccepts(List<BoundAgg> aggs, Table table) {
+        PrimAggAccept[] out = new PrimAggAccept[aggs.size()];
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            if (a.distinct()) {
+                return null;
+            }
+            if (a.fn() == AggregateFn.COUNT_STAR) {
+                out[i] = (state, row) -> state.acceptLong(0L, false);
+                continue;
+            }
+            BoundExpr arg = a.arg();
+            if (!(arg instanceof BoundColumn bc)) {
+                return null;
+            }
+            ColumnType ct = table.columnMeta(bc.index()).type();
+            switch (ct) {
+                case I32 -> {
+                    I32Column c = table.i32(bc.index());
+                    out[i] = (state, row) -> {
+                        boolean n = c.isNullAt(row);
+                        state.acceptLong(n ? 0L : c.get(row), n);
+                    };
+                }
+                case I64 -> {
+                    I64Column c = table.i64(bc.index());
+                    out[i] = (state, row) -> {
+                        boolean n = c.isNullAt(row);
+                        state.acceptLong(n ? 0L : c.get(row), n);
+                    };
+                }
+                case F64 -> {
+                    io.jpointdb.core.column.F64Column c = table.f64(bc.index());
+                    out[i] = (state, row) -> {
+                        boolean n = c.isNullAt(row);
+                        state.acceptDouble(n ? 0.0 : c.get(row), n);
+                    };
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        return out;
+    }
+
     private static LongKeysAggMap scanAggChunkPrimitive(BoundSelect plan, Table table, List<BoundAgg> aggs,
             PrimitiveKeyShape shape, long from, long to) {
         ExprEvaluator ev = new ExprEvaluator(table);
@@ -568,6 +627,7 @@ public final class Executor {
         LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
 
         LongKeyReader reader0 = keyReader(table, shape.colIdx()[0], shape.kinds()[0]);
+        PrimAggAccept[] primAccepts = resolvePrimitiveArgAccepts(aggs, table);
 
         if (shape.width() == 1) {
             for (long r = from; r < to; r++) {
@@ -580,7 +640,7 @@ public final class Executor {
                 } else {
                     states = map.getOrCreate1(reader0.keyAt(r), factory);
                 }
-                acceptAggs(states, aggs, ev, r);
+                acceptAggRow(states, aggs, ev, r, primAccepts);
             }
         } else {
             LongKeyReader reader1 = keyReader(table, shape.colIdx()[1], shape.kinds()[1]);
@@ -599,10 +659,21 @@ public final class Executor {
                 } else {
                     states = map.getOrCreate2(reader0.keyAt(r), reader1.keyAt(r), factory);
                 }
-                acceptAggs(states, aggs, ev, r);
+                acceptAggRow(states, aggs, ev, r, primAccepts);
             }
         }
         return map;
+    }
+
+    private static void acceptAggRow(Aggregator[] states, List<BoundAgg> aggs, ExprEvaluator ev, long r,
+            PrimAggAccept @Nullable [] primAccepts) {
+        if (primAccepts != null) {
+            for (int i = 0; i < primAccepts.length; i++) {
+                primAccepts[i].acceptRow(states[i], r);
+            }
+        } else {
+            acceptAggs(states, aggs, ev, r);
+        }
     }
 
     private static Aggregator[] createStates(List<BoundAgg> aggs) {
