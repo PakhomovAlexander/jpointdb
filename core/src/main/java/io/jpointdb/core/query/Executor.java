@@ -137,6 +137,11 @@ public final class Executor {
         List<BoundAgg> aggs = collectAggregates(plan);
         long n = table.rowCount();
 
+        GrandTotalSumShape sumShape = detectGrandTotalSum(plan, groupExprs, aggs, table);
+        if (sumShape != null) {
+            return executeGrandTotalSum(plan, groupExprs, aggs, table, n, sumShape);
+        }
+
         PrimitiveKeyShape shape = detectPrimitiveKey(groupExprs, table);
         if (shape != null) {
             return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
@@ -253,6 +258,162 @@ public final class Executor {
      * {@link I32Column} or {@link I64Column}. {@code width} is
      * {@code colIdx.length} (1 or 2).
      */
+    // ---------- grand-total SUM over I32 columns (e.g. Q30's 90 SUMs) ----------
+
+    /**
+     * Resolved shape of the grand-total SUM batch path: the single I32 column every
+     * agg shares, plus the per-agg literal offset (0 for plain {@code col}, K for
+     * {@code col + K}). Result indices align with {@code aggs.indexOf}.
+     */
+    @SuppressWarnings("ArrayRecordComponent")
+    private record GrandTotalSumShape(int colIdx, long[] offsets) {
+    }
+
+    private static @Nullable GrandTotalSumShape detectGrandTotalSum(BoundSelect plan, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, Table table) {
+        if (plan.where() != null) {
+            return null;
+        }
+        if (!groupExprs.isEmpty() || aggs.isEmpty()) {
+            return null;
+        }
+        int colIdx = -1;
+        long[] offsets = new long[aggs.size()];
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            if (a.fn() != AggregateFn.SUM || a.distinct()) {
+                return null;
+            }
+            if (a.type() != ValueType.I32 && a.type() != ValueType.I64) {
+                return null;
+            }
+            BoundExpr arg = a.arg();
+            if (arg == null) {
+                return null;
+            }
+            int col;
+            long off;
+            if (arg instanceof BoundColumn bc) {
+                col = bc.index();
+                off = 0L;
+            } else if (arg instanceof BoundBinary bb && bb.op() == SqlAst.BinaryOp.PLUS) {
+                // Accept col+lit or lit+col.
+                BoundColumn bc;
+                BoundLiteral bl;
+                if (bb.left() instanceof BoundColumn lbc && bb.right() instanceof BoundLiteral rbl) {
+                    bc = lbc;
+                    bl = rbl;
+                } else if (bb.right() instanceof BoundColumn rbc && bb.left() instanceof BoundLiteral lbl) {
+                    bc = rbc;
+                    bl = lbl;
+                } else {
+                    return null;
+                }
+                if (!(bl.value() instanceof Long lv)) {
+                    return null;
+                }
+                col = bc.index();
+                off = lv;
+            } else {
+                return null;
+            }
+            if (table.columnMeta(col).type() != ColumnType.I32) {
+                return null;
+            }
+            if (table.i32(col).nullable()) {
+                // Skip the null-bitmap walk for now — fall back to generic path.
+                return null;
+            }
+            if (colIdx == -1) {
+                colIdx = col;
+            } else if (colIdx != col) {
+                return null;
+            }
+            offsets[i] = off;
+        }
+        if (colIdx == -1) {
+            return null;
+        }
+        return new GrandTotalSumShape(colIdx, offsets);
+    }
+
+    /**
+     * Batch size chosen so {@code int[BATCH]} fits in L1 (16 KiB data × 1 lane).
+     */
+    private static final int BATCH_ROWS = 4096;
+
+    @SuppressWarnings("NullAway")
+    private static QueryResult executeGrandTotalSum(BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs,
+            Table table, long n, GrandTotalSumShape shape) {
+        I32Column col = table.i32(shape.colIdx());
+        int aggCount = aggs.size();
+        long[] offsets = shape.offsets();
+
+        long[] perAggSum;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int k = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<long[]>[] tasks = new ForkJoinTask[k];
+            for (int c = 0; c < k; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool().submit(() -> sumBatchChunk(col, offsets, aggCount, from, to));
+            }
+            perAggSum = new long[aggCount];
+            for (ForkJoinTask<long[]> t : tasks) {
+                long[] partial = t.join();
+                for (int i = 0; i < aggCount; i++) {
+                    perAggSum[i] += partial[i];
+                }
+            }
+        } else {
+            perAggSum = sumBatchChunk(col, offsets, aggCount, 0, n);
+        }
+
+        // Build a single-row aggregator result by injecting the primitive sums
+        // back into SumLong states so finalizeAggregated handles the rest.
+        Aggregator[] states = createStates(aggs);
+        for (int i = 0; i < aggCount; i++) {
+            Aggregator st = states[i];
+            // SumLong: primitive-specialized sink — accept one synthetic row with the
+            // total so result() emits it. A zero-row query would need a null, but we
+            // bail out of this path when WHERE is present or n==0.
+            if (n > 0) {
+                st.accept(perAggSum[i]);
+            }
+        }
+        List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
+        return finalizeAggregated(plan, groupExprs, aggs, groups);
+    }
+
+    private static long[] sumBatchChunk(I32Column col, long[] offsets, int aggCount, long from, long to) {
+        long[] sums = new long[aggCount];
+        int[] buf = new int[BATCH_ROWS];
+        long totalColSum = 0;
+        long totalCount = 0;
+        long row = from;
+        while (row < to) {
+            int len = (int) Math.min(BATCH_ROWS, to - row);
+            col.readInts(row, buf, len);
+            long s = 0;
+            // Auto-vectorizable: HotSpot lowers this to a SIMD horizontal add.
+            for (int i = 0; i < len; i++) {
+                s += buf[i];
+            }
+            totalColSum += s;
+            totalCount += len;
+            row += len;
+        }
+        // SUM(col + off) = SUM(col) + count * off. Separable because the PLUS has a
+        // per-agg literal and a shared column read, so one pass replaces aggCount
+        // passes over the same column buffer.
+        for (int a = 0; a < aggCount; a++) {
+            sums[a] = totalColSum + totalCount * offsets[a];
+        }
+        return sums;
+    }
+
     private enum KeyKind {
         I32, I64, DICT_STRING
     }
