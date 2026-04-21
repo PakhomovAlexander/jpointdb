@@ -737,10 +737,18 @@ public final class Executor {
         long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
         long offset = plan.offset() == null ? 0 : plan.offset();
 
+        // Pre-compile ORDER BY expressions to slot-/agg-indexed resolvers so the
+        // per-group loop avoids findMatch/sameAgg linear scans. For Q33 that's
+        // ~3 M findMatch calls collapsed to direct array reads.
+        int orderN = orderBy.size();
+        OrderResolver[] orderResolvers = new OrderResolver[orderN];
+        for (int i = 0; i < orderN; i++) {
+            orderResolvers[i] = compileOrderResolver(orderBy.get(i).expr(), groupExprs, aggs);
+        }
+
         // HAVING filter + ORDER BY value extraction per group. ORDER BY values are
         // per-group, so this is O(groups × orderBy.size()) — cheap compared to the
         // full SELECT materialize we defer until after LIMIT.
-        int orderN = orderBy.size();
         List<PendingGroup> pending = new ArrayList<>(groups.size());
         for (GroupEntry g : groups) {
             if (having != null) {
@@ -752,7 +760,7 @@ public final class Executor {
             @Nullable
             Object[] orderVals = orderN == 0 ? EMPTY_OBJECTS : new @Nullable Object[orderN];
             for (int i = 0; i < orderN; i++) {
-                orderVals[i] = evalPostAgg(orderBy.get(i).expr(), groupExprs, g.key(), aggs, g.states());
+                orderVals[i] = orderResolvers[i].eval(groupExprs, g.key(), aggs, g.states());
             }
             pending.add(new PendingGroup(g.key(), g.states(), orderVals));
         }
@@ -793,6 +801,37 @@ public final class Executor {
     }
 
     private static final Object[] EMPTY_OBJECTS = new Object[0];
+
+    /** Per-group ORDER BY value extractor, bound to a specific expression shape. */
+    private interface OrderResolver {
+        @Nullable
+        Object eval(List<BoundExpr> groupExprs, List<Object> key, List<BoundAgg> aggs, Aggregator[] states);
+    }
+
+    /**
+     * Compiles an ORDER BY expression once per query into an extractor that
+     * avoids per-group findMatch / sameAgg scans. Direct hits are the common
+     * case (ORDER BY <groupKey> or ORDER BY <aggregate>); anything else falls
+     * back to the general evalPostAgg.
+     */
+    private static OrderResolver compileOrderResolver(BoundExpr expr, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs) {
+        for (int i = 0; i < groupExprs.size(); i++) {
+            if (exprEquals(groupExprs.get(i), expr)) {
+                final int idx = i;
+                return (ge, key, ag, st) -> key.get(idx);
+            }
+        }
+        if (expr instanceof BoundAgg) {
+            for (int i = 0; i < aggs.size(); i++) {
+                if (sameAgg(expr, aggs.get(i))) {
+                    final int idx = i;
+                    return (ge, key, ag, st) -> st[idx].result();
+                }
+            }
+        }
+        return (ge, key, ag, st) -> evalPostAgg(expr, ge, key, ag, st);
+    }
 
     private static Comparator<PendingGroup> orderComparator(List<BoundOrderItem> orderBy) {
         return (ga, gb) -> {
