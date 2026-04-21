@@ -809,13 +809,12 @@ public final class Executor {
     }
 
     /**
-     * Compiles an ORDER BY expression once per query into an extractor that
-     * avoids per-group findMatch / sameAgg scans. Direct hits are the common
-     * case (ORDER BY <groupKey> or ORDER BY <aggregate>); anything else falls
-     * back to the general evalPostAgg.
+     * Compiles an ORDER BY expression once per query into an extractor that avoids
+     * per-group findMatch / sameAgg scans. Direct hits are the common case (ORDER
+     * BY <groupKey> or ORDER BY <aggregate>); anything else falls back to the
+     * general evalPostAgg.
      */
-    private static OrderResolver compileOrderResolver(BoundExpr expr, List<BoundExpr> groupExprs,
-            List<BoundAgg> aggs) {
+    private static OrderResolver compileOrderResolver(BoundExpr expr, List<BoundExpr> groupExprs, List<BoundAgg> aggs) {
         for (int i = 0; i < groupExprs.size(); i++) {
             if (exprEquals(groupExprs.get(i), expr)) {
                 final int idx = i;
