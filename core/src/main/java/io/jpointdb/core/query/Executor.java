@@ -408,12 +408,13 @@ public final class Executor {
 
     /**
      * Q07-style {@code SELECT MIN(col), MAX(col) FROM hits} over a DICT-encoded
-     * STRING column: since every stored dict entry corresponds to at least one
-     * row, MIN / MAX of the column equals MIN / MAX over the dict itself. For
-     * EventDate (~30 entries) this is instantaneous; skipped for large dicts
-     * where the walk would outweigh the per-row scan.
+     * STRING column: since every stored dict entry corresponds to at least one row,
+     * MIN / MAX of the column equals MIN / MAX over the dict itself. For EventDate
+     * (~30 entries) this is instantaneous; skipped for large dicts where the walk
+     * would outweigh the per-row scan.
      *
-     * <p>Returns {@code null} to signal "not our shape — fall through".
+     * <p>
+     * Returns {@code null} to signal "not our shape — fall through".
      */
     private static @Nullable QueryResult tryDictMinMaxShortcut(BoundSelect plan, List<BoundExpr> groupExprs,
             List<BoundAgg> aggs, Table table, long n) {

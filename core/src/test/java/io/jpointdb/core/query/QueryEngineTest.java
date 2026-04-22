@@ -307,6 +307,18 @@ class QueryEngineTest {
     }
 
     @Test
+    void dictMinMaxShortcut(@TempDir Path dir) throws IOException {
+        // Exercises tryDictMinMaxShortcut: MIN/MAX over DICT-encoded STRING
+        // column grand-total skips the row scan entirely.
+        try (Table t = convertAndOpen(dir, "2013-07-15\n2013-07-01\n2013-07-31\n2013-07-10\n", List.of("d"))) {
+            QueryResult r = QueryEngine.run(t, "SELECT MIN(d), MAX(d) FROM " + tableName(t));
+            assertEquals(1, r.rowCount());
+            assertEquals("2013-07-01", r.rows().get(0)[0]);
+            assertEquals("2013-07-31", r.rows().get(0)[1]);
+        }
+    }
+
+    @Test
     void dictBitsetRewriteRange(@TempDir Path dir) throws IOException {
         // Exercises DictBitsetRewriter on STRING DICT column range predicate.
         try (Table t = convertAndOpen(dir, "2013-07-01\n2013-07-15\n2013-07-31\n2013-08-01\n", List.of("d"))) {
