@@ -142,6 +142,11 @@ public final class Executor {
             return executeGrandTotalSum(plan, groupExprs, aggs, table, n, sumShape);
         }
 
+        QueryResult dictMinMax = tryDictMinMaxShortcut(plan, groupExprs, aggs, table, n);
+        if (dictMinMax != null) {
+            return dictMinMax;
+        }
+
         VectorBatchAgg[] vbagg = detectGrandTotalVector(plan, groupExprs, aggs, table);
         if (vbagg != null) {
             return executeGrandTotalVector(plan, aggs, n, vbagg);
@@ -394,6 +399,90 @@ public final class Executor {
             if (n > 0) {
                 st.accept(perAggSum[i]);
             }
+        }
+        List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
+        return finalizeAggregated(plan, groupExprs, aggs, groups);
+    }
+
+    // ---------- grand-total MIN/MAX via dict walk (skips the 1 M-row scan) ----------
+
+    /**
+     * Q07-style {@code SELECT MIN(col), MAX(col) FROM hits} over a DICT-encoded
+     * STRING column: since every stored dict entry corresponds to at least one
+     * row, MIN / MAX of the column equals MIN / MAX over the dict itself. For
+     * EventDate (~30 entries) this is instantaneous; skipped for large dicts
+     * where the walk would outweigh the per-row scan.
+     *
+     * <p>Returns {@code null} to signal "not our shape — fall through".
+     */
+    private static @Nullable QueryResult tryDictMinMaxShortcut(BoundSelect plan, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, Table table, long n) {
+        if (plan.where() != null || !groupExprs.isEmpty() || aggs.isEmpty()) {
+            return null;
+        }
+        // All aggs must be MIN or MAX over the same DICT-encoded STRING column,
+        // dict small enough that one walk beats a full scan.
+        int sharedCol = -1;
+        for (BoundAgg a : aggs) {
+            if (a.distinct()) {
+                return null;
+            }
+            if (a.fn() != AggregateFn.MIN && a.fn() != AggregateFn.MAX) {
+                return null;
+            }
+            BoundExpr arg = a.arg();
+            if (!(arg instanceof BoundColumn bc)) {
+                return null;
+            }
+            if (table.columnMeta(bc.index()).type() != ColumnType.STRING) {
+                return null;
+            }
+            io.jpointdb.core.column.StringColumn sc = table.string(bc.index());
+            if (sc.mode() != io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                return null;
+            }
+            if (sharedCol != -1 && sharedCol != bc.index()) {
+                return null; // different columns per agg would need separate walks.
+            }
+            sharedCol = bc.index();
+        }
+        if (sharedCol == -1) {
+            return null;
+        }
+        io.jpointdb.core.column.StringColumn sc = table.string(sharedCol);
+        io.jpointdb.core.column.Dictionary dict = sc.dictionary();
+        if (dict == null) {
+            return null;
+        }
+        int dsize = dict.size();
+        if (dsize == 0 || dsize > 1000) {
+            return null;
+        }
+        if (n == 0) {
+            // Empty table → null result from MIN/MAX.
+            Aggregator[] states = new Aggregator[aggs.size()];
+            for (int i = 0; i < aggs.size(); i++) {
+                states[i] = new PrecomputedAggregator(null);
+            }
+            List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
+            return finalizeAggregated(plan, groupExprs, aggs, groups);
+        }
+        String min = dict.stringAt(0);
+        String max = min;
+        for (int i = 1; i < dsize; i++) {
+            String s = dict.stringAt(i);
+            if (s.compareTo(min) < 0) {
+                min = s;
+            }
+            if (s.compareTo(max) > 0) {
+                max = s;
+            }
+        }
+        String finalMin = min;
+        String finalMax = max;
+        Aggregator[] states = new Aggregator[aggs.size()];
+        for (int i = 0; i < aggs.size(); i++) {
+            states[i] = new PrecomputedAggregator(aggs.get(i).fn() == AggregateFn.MIN ? finalMin : finalMax);
         }
         List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
         return finalizeAggregated(plan, groupExprs, aggs, groups);
