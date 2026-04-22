@@ -144,6 +144,13 @@ public final class Executor {
 
         PrimitiveKeyShape shape = detectPrimitiveKey(groupExprs, table);
         if (shape != null) {
+            SimpleAggShape simple = detectSimpleAggs(aggs, table);
+            if (simple != null) {
+                SlotOrderShape orderShape = detectSlotOrder(plan, groupExprs, aggs, simple, shape);
+                if (orderShape != null && plan.having() == null) {
+                    return executeAggregatedInline(plan, table, groupExprs, aggs, n, shape, simple, orderShape);
+                }
+            }
             return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
         }
 
@@ -423,6 +430,603 @@ public final class Executor {
         int width() {
             return colIdx.length;
         }
+    }
+
+    // ---------- inline primitive state path: PrimitiveAggMap + slot-based top-k ----------
+
+    /**
+     * How to update a slot's state for one row, and how to produce its final value.
+     */
+    private interface InlineAccept {
+        void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row);
+
+        @Nullable
+        Object result(PrimitiveAggMap map, int slot);
+    }
+
+    /** Resolved inline-primitive agg shape: one {@link InlineAccept} per agg. */
+    @SuppressWarnings("ArrayRecordComponent")
+    private record SimpleAggShape(PrimitiveAggMap.AggOp[] mapOps, int longFields, int doubleFields,
+            InlineAccept[] accepts) {
+    }
+
+    /**
+     * Returns a shape iff every agg is one of: COUNT_STAR, or SUM/AVG over a
+     * non-nullable I32/I64/F64 BoundColumn. Distinct or any richer expression
+     * rejects — {@code null} signals "use the Aggregator-per-slot path".
+     */
+    private static @Nullable SimpleAggShape detectSimpleAggs(List<BoundAgg> aggs, Table table) {
+        if (aggs.isEmpty()) {
+            return null;
+        }
+        PrimitiveAggMap.AggOp[] mapOps = new PrimitiveAggMap.AggOp[aggs.size()];
+        InlineAccept[] accepts = new InlineAccept[aggs.size()];
+        int lf = 0;
+        int df = 0;
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            if (a.distinct()) {
+                return null;
+            }
+            if (a.fn() == AggregateFn.COUNT_STAR) {
+                final int longIdx = lf++;
+                mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.COUNT_STAR, longIdx, -1);
+                accepts[i] = new InlineAccept() {
+                    @Override
+                    public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                        longFields[longIdx][slot]++;
+                    }
+
+                    @Override
+                    public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                        return map.longField(longIdx)[slot];
+                    }
+                };
+                continue;
+            }
+            if (a.fn() != AggregateFn.SUM && a.fn() != AggregateFn.AVG) {
+                return null;
+            }
+            BoundExpr arg = a.arg();
+            if (!(arg instanceof BoundColumn bc)) {
+                return null;
+            }
+            ColumnType ct = table.columnMeta(bc.index()).type();
+            boolean isAvg = a.fn() == AggregateFn.AVG;
+            if (ct == ColumnType.I32) {
+                I32Column c = table.i32(bc.index());
+                if (c.nullable()) {
+                    return null;
+                }
+                if (!isAvg) {
+                    final int longIdx = lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.SUM_LONG, longIdx, -1);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            longFields[longIdx][slot] += c.get(row);
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            return map.longField(longIdx)[slot];
+                        }
+                    };
+                } else {
+                    final int doubleIdx = df++;
+                    final int longIdx = lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_LONG, longIdx, doubleIdx);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            doubleFields[doubleIdx][slot] += c.get(row);
+                            longFields[longIdx][slot]++;
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            long cnt = map.longField(longIdx)[slot];
+                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                        }
+                    };
+                }
+            } else if (ct == ColumnType.I64) {
+                I64Column c = table.i64(bc.index());
+                if (c.nullable()) {
+                    return null;
+                }
+                if (!isAvg) {
+                    final int longIdx = lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.SUM_LONG, longIdx, -1);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            longFields[longIdx][slot] += c.get(row);
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            return map.longField(longIdx)[slot];
+                        }
+                    };
+                } else {
+                    final int doubleIdx = df++;
+                    final int longIdx = lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_LONG, longIdx, doubleIdx);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            doubleFields[doubleIdx][slot] += c.get(row);
+                            longFields[longIdx][slot]++;
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            long cnt = map.longField(longIdx)[slot];
+                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                        }
+                    };
+                }
+            } else if (ct == ColumnType.F64) {
+                io.jpointdb.core.column.F64Column c = table.f64(bc.index());
+                if (c.nullable()) {
+                    return null;
+                }
+                final int doubleIdx = df++;
+                if (!isAvg) {
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.SUM_DOUBLE, -1, doubleIdx);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            doubleFields[doubleIdx][slot] += c.get(row);
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            return map.doubleField(doubleIdx)[slot];
+                        }
+                    };
+                } else {
+                    final int longIdx = lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_DOUBLE, longIdx, doubleIdx);
+                    accepts[i] = new InlineAccept() {
+                        @Override
+                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                            doubleFields[doubleIdx][slot] += c.get(row);
+                            longFields[longIdx][slot]++;
+                        }
+
+                        @Override
+                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                            long cnt = map.longField(longIdx)[slot];
+                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                        }
+                    };
+                }
+            } else {
+                return null;
+            }
+        }
+        return new SimpleAggShape(mapOps, lf, df, accepts);
+    }
+
+    /** Reads one ORDER BY component as a {@code long} from a slot's state/key. */
+    private interface SlotLongExtractor {
+        long extract(PrimitiveAggMap map, int slot);
+    }
+
+    /**
+     * Resolved primitive ORDER BY layout: per-item extractor + direction flag, plus
+     * a precompiled sign vector so the comparator is a pure primitive loop.
+     */
+    @SuppressWarnings("ArrayRecordComponent")
+    private record SlotOrderShape(SlotLongExtractor[] extractors, boolean[] desc) {
+    }
+
+    /**
+     * Decides if every ORDER BY expression reads a primitive long: either a
+     * group-key column slot, or a SUM_LONG/COUNT_STAR agg result. AVG / DOUBLE /
+     * expressions force the general path.
+     */
+    private static @Nullable SlotOrderShape detectSlotOrder(BoundSelect plan, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, SimpleAggShape agg, PrimitiveKeyShape key) {
+        List<BoundOrderItem> orderBy = plan.orderBy();
+        if (orderBy.isEmpty()) {
+            return null;
+        }
+        SlotLongExtractor[] extractors = new SlotLongExtractor[orderBy.size()];
+        boolean[] desc = new boolean[orderBy.size()];
+        for (int i = 0; i < orderBy.size(); i++) {
+            BoundOrderItem item = orderBy.get(i);
+            desc[i] = item.direction() == SqlAst.SortDirection.DESC;
+            SlotLongExtractor ext = resolveSlotOrderExtractor(item.expr(), groupExprs, aggs, agg, key);
+            if (ext == null) {
+                return null;
+            }
+            extractors[i] = ext;
+        }
+        return new SlotOrderShape(extractors, desc);
+    }
+
+    private static @Nullable SlotLongExtractor resolveSlotOrderExtractor(BoundExpr expr, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, SimpleAggShape agg, PrimitiveKeyShape key) {
+        for (int i = 0; i < groupExprs.size(); i++) {
+            if (exprEquals(groupExprs.get(i), expr)) {
+                final int component = i;
+                return (m, s) -> m.keyAt(s, component);
+            }
+        }
+        if (expr instanceof BoundAgg be) {
+            for (int i = 0; i < aggs.size(); i++) {
+                if (sameAgg(expr, aggs.get(i))) {
+                    PrimitiveAggMap.AggOp op = agg.mapOps()[i];
+                    // Only long-producing aggs work with a primitive long comparator.
+                    if (op.kind == PrimitiveAggMap.AggOp.Kind.COUNT_STAR
+                            || op.kind == PrimitiveAggMap.AggOp.Kind.SUM_LONG) {
+                        final int longIdx = op.longField;
+                        return (m, s) -> m.longField(longIdx)[s];
+                    }
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Full primitive-inline pipeline for Q33-shaped queries:
+     *
+     * <pre>
+     *     scan → PrimitiveAggMap (flat long/double state, no Aggregator objects)
+     *     merge chunks
+     *     slot-based top-k on primitive long ORDER BY vals (no boxing)
+     *     materialize only K winners (boxing + evalPostAgg for ~10 rows)
+     * </pre>
+     */
+    private static QueryResult executeAggregatedInline(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, long n, PrimitiveKeyShape keyShape, SimpleAggShape aggShape,
+            SlotOrderShape orderShape) {
+        PrimitiveAggMap merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int kBounds = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<PrimitiveAggMap>[] tasks = new ForkJoinTask[kBounds];
+            for (int c = 0; c < kBounds; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool()
+                        .submit(() -> scanAggChunkInline(plan, table, keyShape, aggShape, from, to));
+            }
+            List<PrimitiveAggMap> chunks = new ArrayList<>(kBounds);
+            int totalHint = 0;
+            for (ForkJoinTask<PrimitiveAggMap> t : tasks) {
+                PrimitiveAggMap m = t.join();
+                chunks.add(m);
+                totalHint += m.size();
+            }
+            merged = new PrimitiveAggMap(keyShape.width(), totalHint, aggShape.mapOps(), aggShape.longFields(),
+                    aggShape.doubleFields());
+            merged.ensureCapacity(totalHint);
+            for (PrimitiveAggMap m : chunks) {
+                merged.merge(m);
+            }
+        } else {
+            merged = scanAggChunkInline(plan, table, keyShape, aggShape, 0, n);
+        }
+
+        // Null-group primitive heap is tricky (null keys don't compare as longs);
+        // if any row produced a null group, fall back to the generic materialize.
+        if (merged.hasNull()) {
+            return fallbackFinalize(plan, groupExprs, aggs, keyShape, aggShape, merged, table);
+        }
+
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
+        long bound = Math.min((long) Integer.MAX_VALUE, offset + Math.min(limit, Integer.MAX_VALUE - offset));
+        int k = (int) Math.min((long) merged.nonNullSize(), Math.max(0L, bound));
+
+        int[] winnerSlots;
+        if (k >= merged.nonNullSize()) {
+            // Everyone makes it — full sort by order vals.
+            winnerSlots = sortAllSlots(merged, orderShape);
+        } else {
+            winnerSlots = selectTopKSlots(merged, orderShape, k);
+        }
+
+        int fromIdx = (int) Math.min((long) winnerSlots.length, offset);
+        int toIdx = (int) Math.min((long) winnerSlots.length, fromIdx + Math.min(limit, Integer.MAX_VALUE - fromIdx));
+
+        List<@Nullable Object[]> rows = new ArrayList<>(toIdx - fromIdx);
+        List<BoundSelectItem> items = plan.items();
+        for (int i = fromIdx; i < toIdx; i++) {
+            int slot = winnerSlots[i];
+            List<Object> key = buildKeyFromSlot(merged, slot, keyShape, table);
+            Aggregator[] states = synthesizeStates(merged, slot, aggShape.accepts());
+            @Nullable
+            Object[] row = new @Nullable Object[items.size()];
+            for (int j = 0; j < items.size(); j++) {
+                row[j] = evalPostAgg(items.get(j).expr(), groupExprs, key, aggs, states);
+            }
+            rows.add(row);
+        }
+        return toResult(plan, rows);
+    }
+
+    private static List<Object> buildKeyFromSlot(PrimitiveAggMap map, int slot, PrimitiveKeyShape shape, Table table) {
+        if (shape.width() == 1) {
+            return java.util.Collections
+                    .singletonList(boxKey(table, map.keyAt(slot, 0), false, shape.colIdx()[0], shape.kinds()[0]));
+        }
+        Object[] ka = new Object[]{boxKey(table, map.keyAt(slot, 0), false, shape.colIdx()[0], shape.kinds()[0]),
+                boxKey(table, map.keyAt(slot, 1), false, shape.colIdx()[1], shape.kinds()[1])};
+        return Arrays.asList(ka);
+    }
+
+    private static Aggregator[] synthesizeStates(PrimitiveAggMap map, int slot, InlineAccept[] accepts) {
+        Aggregator[] out = new Aggregator[accepts.length];
+        for (int i = 0; i < accepts.length; i++) {
+            out[i] = new PrecomputedAggregator(accepts[i].result(map, slot));
+        }
+        return out;
+    }
+
+    /** Stateless wrapper that just reports a precomputed boxed result. */
+    private static final class PrecomputedAggregator extends Aggregator {
+        private final @Nullable Object value;
+
+        PrecomputedAggregator(@Nullable Object value) {
+            this.value = value;
+        }
+
+        @Override
+        void accept(@Nullable Object value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        void merge(Aggregator other) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        @Nullable
+        Object result() {
+            return value;
+        }
+    }
+
+    /**
+     * Fallback when the inline primitive fast path can't finish on its own (null
+     * group present, or winner set still requires a complex materialize). Walks
+     * every slot, synthesizes Aggregator[] + boxed key, and hands to
+     * {@link #finalizeAggregated} — same work as the old path, only invoked on the
+     * rare null-group edge.
+     */
+    private static QueryResult fallbackFinalize(BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs,
+            PrimitiveKeyShape keyShape, SimpleAggShape aggShape, PrimitiveAggMap map, Table table) {
+        List<GroupEntry> groups = new ArrayList<>(map.size());
+        int[] slots = map.occupiedSlots();
+        int sz = map.nonNullSize();
+        InlineAccept[] accepts = aggShape.accepts();
+        for (int i = 0; i < sz; i++) {
+            int slot = slots[i];
+            groups.add(
+                    new GroupEntry(buildKeyFromSlot(map, slot, keyShape, table), synthesizeStates(map, slot, accepts)));
+        }
+        if (map.hasNull()) {
+            int slot = map.nullSlot();
+            List<Object> key;
+            if (keyShape.width() == 1) {
+                key = java.util.Collections.singletonList(null);
+            } else {
+                Object[] ka = new Object[]{null, null};
+                key = Arrays.asList(ka);
+            }
+            groups.add(new GroupEntry(key, synthesizeStates(map, slot, accepts)));
+        }
+        return finalizeAggregated(plan, groupExprs, aggs, groups);
+    }
+
+    /**
+     * Bounded-top-k over slot indices. Comparison uses primitive {@code long}s
+     * extracted on demand — no Object[], no boxing. Returns winners in sorted order
+     * (best first).
+     */
+    private static int[] selectTopKSlots(PrimitiveAggMap map, SlotOrderShape order, int k) {
+        if (k <= 0) {
+            return new int[0];
+        }
+        SlotLongExtractor[] extractors = order.extractors();
+        boolean[] desc = order.desc();
+        int[] slots = map.occupiedSlots();
+        int n = map.nonNullSize();
+        // Max-heap semantics for top-k: keep the k "best" (by the multi-key
+        // comparator). Use a min-heap ordered by "worst-first" so the root is
+        // the item to evict. Store candidate long vectors inline: heapSlots[i]
+        // with heapOrderVals[i * orderN .. +orderN].
+        int orderN = extractors.length;
+        int[] heapSlots = new int[k];
+        long[] heapOrderVals = new long[(long) k * orderN > Integer.MAX_VALUE ? Integer.MAX_VALUE : k * orderN];
+        int heapSize = 0;
+        long[] scratch = new long[orderN];
+        for (int i = 0; i < n; i++) {
+            int slot = slots[i];
+            for (int j = 0; j < orderN; j++) {
+                scratch[j] = extractors[j].extract(map, slot);
+            }
+            if (heapSize < k) {
+                heapSlots[heapSize] = slot;
+                System.arraycopy(scratch, 0, heapOrderVals, heapSize * orderN, orderN);
+                heapSize++;
+                siftUpMinHeap(heapSlots, heapOrderVals, heapSize - 1, orderN, desc);
+            } else if (compareForTopK(scratch, 0, heapOrderVals, 0, orderN, desc) < 0) {
+                // scratch is better than current worst (root). Replace root and sift.
+                heapSlots[0] = slot;
+                System.arraycopy(scratch, 0, heapOrderVals, 0, orderN);
+                siftDownMinHeap(heapSlots, heapOrderVals, heapSize, 0, orderN, desc);
+            }
+        }
+        // Extract sorted: repeatedly pull root (worst), reverse at end.
+        int[] result = new int[heapSize];
+        for (int i = heapSize - 1; i >= 0; i--) {
+            result[i] = heapSlots[0];
+            heapSlots[0] = heapSlots[i];
+            System.arraycopy(heapOrderVals, i * orderN, heapOrderVals, 0, orderN);
+            siftDownMinHeap(heapSlots, heapOrderVals, i, 0, orderN, desc);
+        }
+        return result;
+    }
+
+    /** Heap order: "worst" at root so better candidates displace it. */
+    private static void siftUpMinHeap(int[] slots, long[] vals, int i, int orderN, boolean[] desc) {
+        while (i > 0) {
+            int parent = (i - 1) >>> 1;
+            if (compareForTopK(vals, i * orderN, vals, parent * orderN, orderN, desc) > 0) {
+                swapHeap(slots, vals, i, parent, orderN);
+                i = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    private static void siftDownMinHeap(int[] slots, long[] vals, int size, int i, int orderN, boolean[] desc) {
+        while (true) {
+            int l = 2 * i + 1;
+            int r = 2 * i + 2;
+            int worst = i;
+            if (l < size && compareForTopK(vals, l * orderN, vals, worst * orderN, orderN, desc) > 0) {
+                worst = l;
+            }
+            if (r < size && compareForTopK(vals, r * orderN, vals, worst * orderN, orderN, desc) > 0) {
+                worst = r;
+            }
+            if (worst == i) {
+                break;
+            }
+            swapHeap(slots, vals, i, worst, orderN);
+            i = worst;
+        }
+    }
+
+    private static void swapHeap(int[] slots, long[] vals, int i, int j, int orderN) {
+        int ts = slots[i];
+        slots[i] = slots[j];
+        slots[j] = ts;
+        for (int o = 0; o < orderN; o++) {
+            long tv = vals[i * orderN + o];
+            vals[i * orderN + o] = vals[j * orderN + o];
+            vals[j * orderN + o] = tv;
+        }
+    }
+
+    /**
+     * Returns positive when {@code a} sorts WORSE than {@code b} under the user's
+     * {@code desc} flags — i.e., a is a better candidate to be the heap's eviction
+     * target. DESC: smaller value = worse. ASC: larger value = worse.
+     */
+    private static int compareForTopK(long[] aArr, int aOff, long[] bArr, int bOff, int orderN, boolean[] desc) {
+        for (int i = 0; i < orderN; i++) {
+            long a = aArr[aOff + i];
+            long b = bArr[bOff + i];
+            if (a != b) {
+                int cmp = Long.compare(a, b);
+                return desc[i] ? -cmp : cmp;
+            }
+        }
+        return 0;
+    }
+
+    private static int[] sortAllSlots(PrimitiveAggMap map, SlotOrderShape order) {
+        int n = map.nonNullSize();
+        int[] slots = new int[n];
+        System.arraycopy(map.occupiedSlots(), 0, slots, 0, n);
+        SlotLongExtractor[] extractors = order.extractors();
+        boolean[] desc = order.desc();
+        int orderN = extractors.length;
+        long[] vals = new long[(long) n * orderN > Integer.MAX_VALUE ? Integer.MAX_VALUE : n * orderN];
+        for (int i = 0; i < n; i++) {
+            int slot = slots[i];
+            for (int j = 0; j < orderN; j++) {
+                vals[i * orderN + j] = extractors[j].extract(map, slot);
+            }
+        }
+        Integer[] idx = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            idx[i] = i;
+        }
+        final long[] finalVals = vals;
+        final boolean[] finalDesc = desc;
+        final int finalOrderN = orderN;
+        // compareForTopK returns positive when `a` is worse than `b` (heap "evict"
+        // semantic); negative when `a` is better — exactly the natural sort
+        // contract where the "better" element sorts earlier.
+        Arrays.sort(idx, (a, b) -> compareForTopK(finalVals, a * finalOrderN, finalVals, b * finalOrderN, finalOrderN,
+                finalDesc));
+        int[] out = new int[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = slots[idx[i]];
+        }
+        return out;
+    }
+
+    private static PrimitiveAggMap scanAggChunkInline(BoundSelect plan, Table table, PrimitiveKeyShape keyShape,
+            SimpleAggShape aggShape, long from, long to) {
+        ExprEvaluator ev = new ExprEvaluator(table);
+        int chunkHint = (int) Math.min((long) Integer.MAX_VALUE, Math.max(64L, to - from));
+        PrimitiveAggMap map = new PrimitiveAggMap(keyShape.width(), chunkHint, aggShape.mapOps(), aggShape.longFields(),
+                aggShape.doubleFields());
+        BoundExpr where = plan.where();
+        InlineAccept[] accepts = aggShape.accepts();
+
+        LongKeyReader reader0 = keyReader(table, keyShape.colIdx()[0], keyShape.kinds()[0]);
+        long[][] lf = map.longFields;
+        double[][] df = map.doubleFields;
+        int cap = map.capacity();
+        if (keyShape.width() == 1) {
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                int slot;
+                if (reader0.isNullAt(r)) {
+                    slot = map.getOrCreateNullSlot();
+                } else {
+                    slot = map.getOrCreateSlot1(reader0.keyAt(r));
+                }
+                if (map.capacity() != cap) {
+                    lf = map.longFields;
+                    df = map.doubleFields;
+                    cap = map.capacity();
+                }
+                for (int i = 0; i < accepts.length; i++) {
+                    accepts[i].acceptRow(lf, df, slot, r);
+                }
+            }
+        } else {
+            LongKeyReader reader1 = keyReader(table, keyShape.colIdx()[1], keyShape.kinds()[1]);
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                int slot;
+                if (reader0.isNullAt(r) || reader1.isNullAt(r)) {
+                    slot = map.getOrCreateNullSlot();
+                } else {
+                    slot = map.getOrCreateSlot2(reader0.keyAt(r), reader1.keyAt(r));
+                }
+                if (map.capacity() != cap) {
+                    lf = map.longFields;
+                    df = map.doubleFields;
+                    cap = map.capacity();
+                }
+                for (int i = 0; i < accepts.length; i++) {
+                    accepts[i].acceptRow(lf, df, slot, r);
+                }
+            }
+        }
+        return map;
     }
 
     private static @Nullable PrimitiveKeyShape detectPrimitiveKey(List<BoundExpr> groupExprs, Table table) {

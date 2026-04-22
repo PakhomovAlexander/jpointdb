@@ -213,6 +213,77 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void inlinePrimitiveAggPathQ33Shape(@TempDir Path dir) throws IOException {
+        // Exercises the PrimitiveAggMap fast path: two-integer-column GROUP BY,
+        // COUNT_STAR + SUM + AVG over non-nullable integer columns, ORDER BY
+        // with primitive resolvers, LIMIT.
+        StringBuilder tsv = new StringBuilder();
+        tsv.append("1\t10\t1\t100\n").append("1\t10\t0\t200\n").append("1\t20\t1\t50\n").append("2\t30\t0\t10\n")
+                .append("1\t10\t1\t300\n");
+        try (Table t = convertAndOpen(dir, tsv.toString(), List.of("a", "b", "flag", "v"))) {
+            QueryResult r = QueryEngine.run(t, "SELECT a, b, COUNT(*) AS c, SUM(flag), AVG(v) FROM " + tableName(t)
+                    + " GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10;");
+            assertEquals(3, r.rowCount());
+            // (1,10) appears 3× → c=3, sum(flag)=2, avg(v)=(100+200+300)/3=200
+            assertEquals(1L, r.rows().get(0)[0]);
+            assertEquals(10L, r.rows().get(0)[1]);
+            assertEquals(3L, r.rows().get(0)[2]);
+            assertEquals(2L, r.rows().get(0)[3]);
+            assertEquals(200.0, (Double) r.rows().get(0)[4], 1e-9);
+            // Remaining two rows each have c=1; sort is by (c DESC, a, b).
+            assertEquals(1L, r.rows().get(1)[0]);
+            assertEquals(20L, r.rows().get(1)[1]);
+            assertEquals(1L, r.rows().get(1)[2]);
+            assertEquals(2L, r.rows().get(2)[0]);
+            assertEquals(30L, r.rows().get(2)[1]);
+        }
+    }
+
+    @Test
+    void inlinePrimitiveAvgOverF64(@TempDir Path dir) throws IOException {
+        // AVG path over F64 non-nullable column — exercises doubleField route
+        // and the AVG_DOUBLE kind in PrimitiveAggMap.
+        try (Table t = convertAndOpen(dir, "1\t10.5\n1\t20.5\n2\t5.0\n", List.of("k", "v"))) {
+            QueryResult r =
+                    QueryEngine.run(t, "SELECT k, COUNT(*), AVG(v) FROM " + tableName(t) + " GROUP BY k ORDER BY k;");
+            assertEquals(2, r.rowCount());
+            assertEquals(1L, r.rows().get(0)[0]);
+            assertEquals(2L, r.rows().get(0)[1]);
+            assertEquals(15.5, (Double) r.rows().get(0)[2], 1e-9);
+            assertEquals(2L, r.rows().get(1)[0]);
+            assertEquals(1L, r.rows().get(1)[1]);
+            assertEquals(5.0, (Double) r.rows().get(1)[2], 1e-9);
+        }
+    }
+
+    @Test
+    void inlinePrimitiveSumF64(@TempDir Path dir) throws IOException {
+        // SUM(F64) → SUM_DOUBLE in the PrimitiveAggMap layout.
+        try (Table t = convertAndOpen(dir, "1\t1.5\n1\t2.5\n2\t3.0\n", List.of("k", "v"))) {
+            QueryResult r = QueryEngine.run(t, "SELECT k, SUM(v) FROM " + tableName(t) + " GROUP BY k ORDER BY k;");
+            assertEquals(2, r.rowCount());
+            assertEquals(4.0, (Double) r.rows().get(0)[1], 1e-9);
+            assertEquals(3.0, (Double) r.rows().get(1)[1], 1e-9);
+        }
+    }
+
+    @Test
+    void inlinePrimitiveSingleColumnCount(@TempDir Path dir) throws IOException {
+        // width=1 primitive path — GROUP BY single I64 column.
+        try (Table t = convertAndOpen(dir, "1\n2\n1\n3\n1\n2\n", List.of("k"))) {
+            QueryResult r = QueryEngine.run(t,
+                    "SELECT k, COUNT(*) AS c FROM " + tableName(t) + " GROUP BY k ORDER BY c DESC, k LIMIT 3;");
+            assertEquals(3, r.rowCount());
+            assertEquals(1L, r.rows().get(0)[0]);
+            assertEquals(3L, r.rows().get(0)[1]);
+            assertEquals(2L, r.rows().get(1)[0]);
+            assertEquals(2L, r.rows().get(1)[1]);
+            assertEquals(3L, r.rows().get(2)[0]);
+            assertEquals(1L, r.rows().get(2)[1]);
+        }
+    }
+
     private static String tableName(Table t) {
         String name = t.dir().getFileName().toString();
         return name.endsWith(".jpdb") ? name.substring(0, name.length() - 5) : name;
