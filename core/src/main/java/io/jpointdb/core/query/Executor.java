@@ -562,10 +562,32 @@ public final class Executor {
         I32, I64, DICT_STRING
     }
 
+    /**
+     * Resolved primitive GROUP BY shape. The SQL {@code GROUP BY} list can mix
+     * {@link BoundColumn} (real key columns) and {@link BoundLiteral} (constant
+     * values that produce a single partition — semantically a no-op).
+     *
+     * <ul>
+     * <li>{@code colIdx} / {@code kinds} describe the actual hash-key columns (size
+     * = 1 or 2 = hash width).</li>
+     * <li>{@code exprToKey[i]} = index into {@code colIdx} for the i-th
+     * {@code groupExprs} entry, or -1 if it's a literal.</li>
+     * <li>{@code literalValues[i]} = the boxed literal value if
+     * {@code exprToKey[i] == -1}; {@code null} otherwise.</li>
+     * </ul>
+     *
+     * <p>
+     * Q35 {@code GROUP BY 1, URL} becomes width-1 DICT_STRING on URL with
+     * {@code exprToKey = [-1, 0]} and {@code literalValues = [1L, null]}.
+     */
     @SuppressWarnings("ArrayRecordComponent")
-    private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds) {
+    private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds, int[] exprToKey, @Nullable Object[] literalValues) {
         int width() {
             return colIdx.length;
+        }
+
+        int exprCount() {
+            return exprToKey.length;
         }
     }
 
@@ -789,7 +811,14 @@ public final class Executor {
             List<BoundAgg> aggs, SimpleAggShape agg, PrimitiveKeyShape key) {
         for (int i = 0; i < groupExprs.size(); i++) {
             if (exprEquals(groupExprs.get(i), expr)) {
-                final int component = i;
+                int keyIdx = key.exprToKey()[i];
+                // Literal-backed group expr: sort order is constant across all groups.
+                // Bail out — falling back to the full materialize path is simpler than
+                // plumbing a constant extractor through the primitive heap.
+                if (keyIdx < 0) {
+                    return null;
+                }
+                final int component = keyIdx;
                 return (m, s) -> m.keyAt(s, component);
             }
         }
@@ -891,13 +920,25 @@ public final class Executor {
     }
 
     private static List<Object> buildKeyFromSlot(PrimitiveAggMap map, int slot, PrimitiveKeyShape shape, Table table) {
-        if (shape.width() == 1) {
-            return java.util.Collections
-                    .singletonList(boxKey(table, map.keyAt(slot, 0), false, shape.colIdx()[0], shape.kinds()[0]));
+        int n = shape.exprCount();
+        // Fast path: single column, no literal slots (covers most existing
+        // one- and two-col GROUP BY shapes without paying for the general loop).
+        if (n == 1) {
+            int keyIdx = shape.exprToKey()[0];
+            Object v = keyIdx < 0 ? shape.literalValues()[0]
+                                  : boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx],
+                                          shape.kinds()[keyIdx]);
+            return java.util.Collections.singletonList(v);
         }
-        Object[] ka = new Object[]{boxKey(table, map.keyAt(slot, 0), false, shape.colIdx()[0], shape.kinds()[0]),
-                boxKey(table, map.keyAt(slot, 1), false, shape.colIdx()[1], shape.kinds()[1])};
-        return Arrays.asList(ka);
+        @Nullable
+        Object[] values = new @Nullable Object[n];
+        for (int i = 0; i < n; i++) {
+            int keyIdx = shape.exprToKey()[i];
+            values[i] = keyIdx < 0 ? shape.literalValues()[i]
+                                   : boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx],
+                                           shape.kinds()[keyIdx]);
+        }
+        return Arrays.asList(values);
     }
 
     private static Aggregator[] synthesizeStates(PrimitiveAggMap map, int slot, InlineAccept[] accepts) {
@@ -953,11 +994,23 @@ public final class Executor {
         }
         if (map.hasNull()) {
             int slot = map.nullSlot();
+            // Null group: every column component reports null; literal positions
+            // keep their constant.
+            int g = keyShape.exprCount();
+            int[] exprToKey = keyShape.exprToKey();
+            @Nullable
+            Object[] literalValues = keyShape.literalValues();
             List<Object> key;
-            if (keyShape.width() == 1) {
-                key = java.util.Collections.singletonList(null);
+            if (g == 1) {
+                int ki = exprToKey[0];
+                key = java.util.Collections.singletonList(ki < 0 ? literalValues[0] : null);
             } else {
-                Object[] ka = new Object[]{null, null};
+                @Nullable
+                Object[] ka = new @Nullable Object[g];
+                for (int i = 0; i < g; i++) {
+                    int ki = exprToKey[i];
+                    ka[i] = ki < 0 ? literalValues[i] : null;
+                }
                 key = Arrays.asList(ka);
             }
             groups.add(new GroupEntry(key, synthesizeStates(map, slot, accepts)));
@@ -1167,30 +1220,51 @@ public final class Executor {
     }
 
     private static @Nullable PrimitiveKeyShape detectPrimitiveKey(List<BoundExpr> groupExprs, Table table) {
-        int w = groupExprs.size();
-        if (w < 1 || w > 2) {
+        int g = groupExprs.size();
+        if (g < 1) {
             return null;
         }
-        int[] cols = new int[w];
-        KeyKind[] kinds = new KeyKind[w];
-        for (int i = 0; i < w; i++) {
-            if (!(groupExprs.get(i) instanceof BoundColumn bc)) {
-                return null;
-            }
-            ColumnType t = table.columnMeta(bc.index()).type();
-            if (t == ColumnType.I32) {
-                kinds[i] = KeyKind.I32;
-            } else if (t == ColumnType.I64) {
-                kinds[i] = KeyKind.I64;
-            } else if (t == ColumnType.STRING
-                    && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
-                kinds[i] = KeyKind.DICT_STRING;
+        int[] exprToKey = new int[g];
+        @Nullable
+        Object[] literalValues = new @Nullable Object[g];
+        // First pass: classify each group expr, count columns, reject anything else.
+        int colCount = 0;
+        for (int i = 0; i < g; i++) {
+            BoundExpr e = groupExprs.get(i);
+            if (e instanceof BoundColumn) {
+                exprToKey[i] = colCount++;
+            } else if (e instanceof BoundLiteral lit) {
+                exprToKey[i] = -1;
+                literalValues[i] = lit.value();
             } else {
                 return null;
             }
-            cols[i] = bc.index();
         }
-        return new PrimitiveKeyShape(cols, kinds);
+        if (colCount < 1 || colCount > 2) {
+            return null;
+        }
+        int[] cols = new int[colCount];
+        KeyKind[] kinds = new KeyKind[colCount];
+        for (int i = 0; i < g; i++) {
+            int ki = exprToKey[i];
+            if (ki < 0) {
+                continue;
+            }
+            BoundColumn bc = (BoundColumn) groupExprs.get(i);
+            ColumnType t = table.columnMeta(bc.index()).type();
+            if (t == ColumnType.I32) {
+                kinds[ki] = KeyKind.I32;
+            } else if (t == ColumnType.I64) {
+                kinds[ki] = KeyKind.I64;
+            } else if (t == ColumnType.STRING
+                    && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                kinds[ki] = KeyKind.DICT_STRING;
+            } else {
+                return null;
+            }
+            cols[ki] = bc.index();
+        }
+        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues);
     }
 
     private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
@@ -1226,18 +1300,50 @@ public final class Executor {
         }
 
         List<GroupEntry> groups = new ArrayList<>(merged.size());
+        int g = shape.exprCount();
+        int[] exprToKey = shape.exprToKey();
+        @Nullable
+        Object[] literalValues = shape.literalValues();
+        int[] colIdx = shape.colIdx();
+        KeyKind[] kinds = shape.kinds();
         if (shape.width() == 1) {
-            merged.forEachKey1((k, isNull, states) -> groups.add(new GroupEntry(
-                    java.util.Collections.singletonList(boxKey(table, k, isNull, shape.colIdx()[0], shape.kinds()[0])),
-                    states)));
+            merged.forEachKey1((k, isNull, states) -> {
+                Object boxed = boxKey(table, k, isNull, colIdx[0], kinds[0]);
+                List<Object> key = buildKeyList(g, exprToKey, literalValues, boxed, null);
+                groups.add(new GroupEntry(key, states));
+            });
         } else {
             merged.forEachKey2((a, b, isNull, states) -> {
-                Object[] ka = new Object[]{boxKey(table, a, isNull, shape.colIdx()[0], shape.kinds()[0]),
-                        boxKey(table, b, isNull, shape.colIdx()[1], shape.kinds()[1])};
-                groups.add(new GroupEntry(Arrays.asList(ka), states));
+                Object boxedA = boxKey(table, a, isNull, colIdx[0], kinds[0]);
+                Object boxedB = boxKey(table, b, isNull, colIdx[1], kinds[1]);
+                List<Object> key = buildKeyList(g, exprToKey, literalValues, boxedA, boxedB);
+                groups.add(new GroupEntry(key, states));
             });
         }
         return finalizeAggregated(plan, groupExprs, aggs, groups);
+    }
+
+    /**
+     * Assembles a GROUP BY key list that honours the original expr ordering and
+     * splices literals back in at the positions {@link PrimitiveKeyShape} recorded.
+     */
+    private static List<Object> buildKeyList(int exprCount, int[] exprToKey, @Nullable Object[] literalValues,
+            @Nullable Object keyA, @Nullable Object keyB) {
+        if (exprCount == 1) {
+            int ki = exprToKey[0];
+            return java.util.Collections.singletonList(ki < 0 ? literalValues[0] : keyA);
+        }
+        @Nullable
+        Object[] out = new @Nullable Object[exprCount];
+        for (int i = 0; i < exprCount; i++) {
+            int ki = exprToKey[i];
+            if (ki < 0) {
+                out[i] = literalValues[i];
+            } else {
+                out[i] = (ki == 0) ? keyA : keyB;
+            }
+        }
+        return Arrays.asList(out);
     }
 
     /**

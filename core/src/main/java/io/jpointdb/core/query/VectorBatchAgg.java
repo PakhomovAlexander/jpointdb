@@ -348,15 +348,11 @@ abstract class VectorBatchAgg {
             while (row < to) {
                 int len = (int) Math.min(BATCH_ROWS, to - row);
                 col.readLongs(row, buf, len);
-                int bound = I64_SPECIES.loopBound(len);
-                int i = 0;
-                LongVector acc = LongVector.zero(I64_SPECIES);
-                for (; i < bound; i += I64_SPECIES.length()) {
-                    acc = acc.add(LongVector.fromArray(I64_SPECIES, buf, i));
-                }
-                s += (double) acc.reduceLanes(VectorOperators.ADD);
-                for (; i < len; i++) {
-                    s += buf[i];
+                // Scalar double accumulator — long-valued I64 columns can average
+                // to values (e.g. UserID ≈ 2^60) whose SUM-as-long overflows on
+                // 1 M rows. HotSpot still auto-vectorizes the double+=long pattern.
+                for (int i = 0; i < len; i++) {
+                    s += (double) buf[i];
                 }
                 c += len;
                 row += len;
