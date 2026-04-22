@@ -47,6 +47,19 @@ public final class Executor {
     private static QueryResult executeScalar(BoundSelect plan, Table table) {
         long n = table.rowCount();
         int orderCount = plan.orderBy().size();
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
+        long bound = (limit == Long.MAX_VALUE) ? Long.MAX_VALUE : offset + limit;
+
+        // Top-k fast path: when the query has ORDER BY + small LIMIT and no
+        // DISTINCT post-processing, keep only the (offset+limit) best
+        // candidates in a bounded heap per chunk, merge K winners across
+        // chunks. Avoids the O(N) materialize + O(N log N) sort of the
+        // general path — crucial for queries like Q25/Q27 where String
+        // compareTo on EventTime dominates.
+        if (orderCount > 0 && bound <= 1000 && bound > 0 && n > 0) {
+            return executeScalarTopK(plan, table, n, orderCount, (int) bound, (int) offset, (int) limit);
+        }
 
         ScalarChunk merged;
         if (n >= PARALLEL_THRESHOLD) {
@@ -96,9 +109,132 @@ public final class Executor {
                 ordered.add(values.get(i));
             values = ordered;
         }
-        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
-        long offset = plan.offset() == null ? 0 : plan.offset();
         return toResult(plan, applyLimit(values, offset, limit));
+    }
+
+    /**
+     * One scalar row that's made it into a top-k heap: SELECT values + ORDER BY
+     * keys.
+     */
+    private record ScalarTopKEntry(@Nullable Object[] values, @Nullable Object[] sortKeys) {
+    }
+
+    /**
+     * Bounded-heap top-k for scalar ORDER BY + LIMIT. Each chunk keeps its own
+     * {@code k}-element heap; we concatenate the chunks' winners and sort them once
+     * at the end. K is small (bench shows 10-1000), so the sort of
+     * {@code chunks × k} items is trivial.
+     */
+    private static QueryResult executeScalarTopK(BoundSelect plan, Table table, long n, int orderCount, int k,
+            int offset, long limit) {
+        boolean[] desc = new boolean[orderCount];
+        for (int i = 0; i < orderCount; i++) {
+            desc[i] = plan.orderBy().get(i).direction() == SqlAst.SortDirection.DESC;
+        }
+        List<ScalarTopKEntry> merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int nc = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<List<ScalarTopKEntry>>[] tasks = new ForkJoinTask[nc];
+            for (int c = 0; c < nc; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool()
+                        .submit(() -> scanScalarChunkTopK(plan, table, from, to, orderCount, k, desc));
+            }
+            merged = new ArrayList<>(nc * k);
+            for (ForkJoinTask<List<ScalarTopKEntry>> t : tasks) {
+                merged.addAll(t.join());
+            }
+        } else {
+            merged = scanScalarChunkTopK(plan, table, 0, n, orderCount, k, desc);
+        }
+        merged.sort((a, b) -> {
+            @Nullable
+            Object[] ka = a.sortKeys();
+            @Nullable
+            Object[] kb = b.sortKeys();
+            for (int i = 0; i < orderCount; i++) {
+                int c = compareNullsLast(ka[i], kb[i]);
+                if (c != 0) {
+                    return desc[i] ? -c : c;
+                }
+            }
+            return 0;
+        });
+        int fromIdx = Math.min(merged.size(), offset);
+        int toIdx = (int) Math.min((long) merged.size(), fromIdx + Math.min(limit, Integer.MAX_VALUE - fromIdx));
+        List<@Nullable Object[]> rows = new ArrayList<>(toIdx - fromIdx);
+        for (int i = fromIdx; i < toIdx; i++) {
+            rows.add(merged.get(i).values());
+        }
+        return toResult(plan, rows);
+    }
+
+    private static List<ScalarTopKEntry> scanScalarChunkTopK(BoundSelect plan, Table table, long from, long to,
+            int orderCount, int k, boolean[] desc) {
+        ExprEvaluator ev = new ExprEvaluator(table);
+        BoundExpr where = plan.where();
+        List<BoundSelectItem> items = plan.items();
+        List<BoundOrderItem> orderBy = plan.orderBy();
+        // Min-heap ordered so the current WORST candidate sits at the root:
+        // new candidates replace it only when they rank strictly better.
+        java.util.Comparator<ScalarTopKEntry> worstFirst = (a, b) -> {
+            @Nullable
+            Object[] ka = a.sortKeys();
+            @Nullable
+            Object[] kb = b.sortKeys();
+            for (int i = 0; i < orderCount; i++) {
+                int c = compareNullsLast(ka[i], kb[i]);
+                if (c != 0) {
+                    return desc[i] ? c : -c; // reversed: worst first
+                }
+            }
+            return 0;
+        };
+        java.util.PriorityQueue<ScalarTopKEntry> heap = new java.util.PriorityQueue<>(k, worstFirst);
+        for (long r = from; r < to; r++) {
+            if (where != null && !truthy(ev.eval(where, r))) {
+                continue;
+            }
+            @Nullable
+            Object[] keys = new @Nullable Object[orderCount];
+            for (int i = 0; i < orderCount; i++) {
+                keys[i] = ev.eval(orderBy.get(i).expr(), r);
+            }
+            if (heap.size() < k) {
+                @Nullable
+                Object[] v = new @Nullable Object[items.size()];
+                for (int i = 0; i < items.size(); i++) {
+                    v[i] = ev.eval(items.get(i).expr(), r);
+                }
+                heap.add(new ScalarTopKEntry(v, keys));
+            } else {
+                // Better than current worst?
+                ScalarTopKEntry worst = heap.peek();
+                @Nullable
+                Object[] wk = worst.sortKeys();
+                boolean better = false;
+                for (int i = 0; i < orderCount; i++) {
+                    int c = compareNullsLast(keys[i], wk[i]);
+                    if (c != 0) {
+                        better = desc[i] ? c > 0 : c < 0;
+                        break;
+                    }
+                }
+                if (better) {
+                    @Nullable
+                    Object[] v = new @Nullable Object[items.size()];
+                    for (int i = 0; i < items.size(); i++) {
+                        v[i] = ev.eval(items.get(i).expr(), r);
+                    }
+                    heap.poll();
+                    heap.add(new ScalarTopKEntry(v, keys));
+                }
+            }
+        }
+        return new ArrayList<>(heap);
     }
 
     private record ScalarChunk(List<@Nullable Object[]> values, @Nullable List<@Nullable Object[]> sortKeys) {

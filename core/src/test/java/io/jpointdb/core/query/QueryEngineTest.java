@@ -307,6 +307,31 @@ class QueryEngineTest {
     }
 
     @Test
+    void scalarTopKOrderByLimit(@TempDir Path dir) throws IOException {
+        // Exercises executeScalarTopK: ORDER BY + LIMIT on a scalar query uses
+        // a bounded heap, not a full sort.
+        try (Table t = convertAndOpen(dir, "3\tz\n1\tx\n2\ty\n5\tv\n4\tw\n", List.of("k", "s"))) {
+            QueryResult r = QueryEngine.run(t, "SELECT s FROM " + tableName(t) + " WHERE s <> '' ORDER BY k LIMIT 3");
+            assertEquals(3, r.rowCount());
+            assertEquals("x", r.rows().get(0)[0]);
+            assertEquals("y", r.rows().get(1)[0]);
+            assertEquals("z", r.rows().get(2)[0]);
+        }
+    }
+
+    @Test
+    void scalarTopKDescMultiCol(@TempDir Path dir) throws IOException {
+        try (Table t = convertAndOpen(dir, "1\ta\n2\tb\n1\tb\n2\ta\n1\tc\n", List.of("k", "s"))) {
+            QueryResult r = QueryEngine.run(t, "SELECT k, s FROM " + tableName(t) + " ORDER BY k DESC, s ASC LIMIT 2");
+            assertEquals(2, r.rowCount());
+            assertEquals(2L, r.rows().get(0)[0]);
+            assertEquals("a", r.rows().get(0)[1]);
+            assertEquals(2L, r.rows().get(1)[0]);
+            assertEquals("b", r.rows().get(1)[1]);
+        }
+    }
+
+    @Test
     void dictMinMaxShortcut(@TempDir Path dir) throws IOException {
         // Exercises tryDictMinMaxShortcut: MIN/MAX over DICT-encoded STRING
         // column grand-total skips the row scan entirely.
