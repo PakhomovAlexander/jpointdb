@@ -1796,6 +1796,8 @@ public final class Executor {
             }
             case BoundScalarCall sc ->
                 ExprEvaluator.evalScalarCall(sc, a -> evalPostAgg(a, groupExprs, key, aggs, states));
+            case BoundDictBitsetMatch m ->
+                throw new AssertionError("dict-bitset match should only appear in WHERE, not post-agg");
             case BoundAgg a -> throw new AssertionError("unregistered agg: " + a);
         };
     }
@@ -1954,6 +1956,7 @@ public final class Executor {
                 for (BoundExpr x : sc.args())
                     collect(x, out);
             }
+            case BoundDictBitsetMatch ignored -> {}
             case BoundLiteral ignored -> {}
             case BoundColumn ignored -> {}
         }

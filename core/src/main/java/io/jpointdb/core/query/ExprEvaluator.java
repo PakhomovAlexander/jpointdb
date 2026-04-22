@@ -56,8 +56,18 @@ public final class ExprEvaluator {
             case BoundInList il -> evalInList(il, row);
             case BoundCase c -> evalCase(c, row);
             case BoundScalarCall sc -> evalScalarCall(sc, arg -> eval(arg, row));
+            case BoundDictBitsetMatch m -> evalBitsetMatch(m, row);
             case BoundAgg a -> throw new SqlException("aggregate encountered in row-eval path", 0);
         };
+    }
+
+    private @Nullable Object evalBitsetMatch(BoundDictBitsetMatch m, long row) {
+        StringColumn c = table.string(m.columnIndex());
+        if (c.isNullAt(row)) {
+            return null;
+        }
+        boolean hit = m.bitset()[c.idAt(row)];
+        return m.negated() ? !hit : hit;
     }
 
     /**

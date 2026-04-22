@@ -17,7 +17,7 @@ public final class BoundAst {
     }
 
     public sealed interface BoundExpr permits BoundLiteral, BoundColumn, BoundUnary, BoundBinary, BoundIsNull,
-            BoundLike, BoundInList, BoundCase, BoundAgg, BoundScalarCall {
+            BoundLike, BoundInList, BoundCase, BoundAgg, BoundScalarCall, BoundDictBitsetMatch {
         ValueType type();
         String defaultName();
     }
@@ -108,6 +108,30 @@ public final class BoundAst {
     }
 
     /** A non-aggregate (scalar) function call, e.g. {@code strlen(URL)}. */
+    /**
+     * Precomputed predicate on a DICT-encoded STRING column: {@code bitset[id]}
+     * answers whether each dict id satisfies the original string comparison(s).
+     * Built at bind time from patterns like {@code col = 'x'}, {@code col <> 'x'},
+     * {@code col >= 'lo' AND col <= 'hi'}. The hot path reads one int (dict id)
+     * and one boolean[] lookup per row — no String allocation, no compareTo.
+     *
+     * <p>{@code negated} toggles the stored bitset (used for {@code NOT} / {@code <>}
+     * without rewriting the array).
+     */
+    @SuppressWarnings("ArrayRecordComponent")
+    public record BoundDictBitsetMatch(int columnIndex, String columnName, boolean[] bitset,
+            boolean negated) implements BoundExpr {
+        @Override
+        public ValueType type() {
+            return ValueType.BOOL;
+        }
+
+        @Override
+        public String defaultName() {
+            return columnName + (negated ? " NOT IN (...)" : " IN (...)");
+        }
+    }
+
     public record BoundScalarCall(String name, List<BoundExpr> args, ValueType type) implements BoundExpr {
         public BoundScalarCall {
             args = List.copyOf(args);

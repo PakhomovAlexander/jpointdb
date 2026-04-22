@@ -60,6 +60,9 @@ public final class Binder {
         // WHERE cannot reference aliases (standard SQL scope).
         aliasScope = null;
         BoundExpr where = sel.where() == null ? null : ensureBool(bindExpr(sel.where()));
+        if (where != null) {
+            where = DictBitsetRewriter.rewrite(where, table);
+        }
         // GROUP BY / HAVING / ORDER BY may reference SELECT-list aliases.
         aliasScope = new HashMap<>();
         for (BoundSelectItem it : items) {
@@ -338,6 +341,7 @@ public final class Binder {
             }
             case BoundLiteral ignored -> false;
             case BoundColumn ignored -> false;
+            case BoundDictBitsetMatch ignored -> false;
         };
     }
 }
