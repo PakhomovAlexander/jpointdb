@@ -241,6 +241,28 @@ class QueryEngineTest {
     }
 
     @Test
+    void vectorBatchGrandTotalAllKinds(@TempDir Path dir) throws IOException {
+        // Grand-total over primitive columns — hits the VectorBatchAgg SIMD path.
+        try (Table t =
+                convertAndOpen(dir, "1\t10\t1.5\n2\t20\t2.5\n3\t30\t3.5\n4\t40\t4.5\n", List.of("a", "b", "c"))) {
+            QueryResult r = QueryEngine.run(t,
+                    "SELECT COUNT(*), SUM(a), AVG(a), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), SUM(c), AVG(c) FROM "
+                            + tableName(t));
+            assertEquals(1, r.rowCount());
+            assertEquals(4L, r.rows().get(0)[0]);   // COUNT(*)
+            assertEquals(10L, r.rows().get(0)[1]);  // SUM(a) = 1+2+3+4
+            assertEquals(2.5, (Double) r.rows().get(0)[2], 1e-9); // AVG(a)
+            assertEquals(1L, r.rows().get(0)[3]);   // MIN(a)
+            assertEquals(4L, r.rows().get(0)[4]);   // MAX(a)
+            assertEquals(100L, r.rows().get(0)[5]); // SUM(b) = 10+20+30+40
+            assertEquals(10L, r.rows().get(0)[6]);  // MIN(b)
+            assertEquals(40L, r.rows().get(0)[7]);  // MAX(b)
+            assertEquals(12.0, (Double) r.rows().get(0)[8], 1e-9); // SUM(c)
+            assertEquals(3.0, (Double) r.rows().get(0)[9], 1e-9);  // AVG(c)
+        }
+    }
+
+    @Test
     void inlinePrimitiveAvgOverF64(@TempDir Path dir) throws IOException {
         // AVG path over F64 non-nullable column — exercises doubleField route
         // and the AVG_DOUBLE kind in PrimitiveAggMap.

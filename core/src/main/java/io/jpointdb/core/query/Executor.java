@@ -142,6 +142,11 @@ public final class Executor {
             return executeGrandTotalSum(plan, groupExprs, aggs, table, n, sumShape);
         }
 
+        VectorBatchAgg[] vbagg = detectGrandTotalVector(plan, groupExprs, aggs, table);
+        if (vbagg != null) {
+            return executeGrandTotalVector(plan, aggs, n, vbagg);
+        }
+
         PrimitiveKeyShape shape = detectPrimitiveKey(groupExprs, table);
         if (shape != null) {
             SimpleAggShape simple = detectSimpleAggs(aggs, table);
@@ -392,6 +397,138 @@ public final class Executor {
         }
         List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
         return finalizeAggregated(plan, groupExprs, aggs, groups);
+    }
+
+    // ---------- general grand-total via VectorBatchAgg (SIMD) ----------
+
+    /**
+     * Matches grand-total queries whose every agg is a COUNT_STAR, or SUM / AVG /
+     * MIN / MAX over a non-nullable I32 / I64 / F64 BoundColumn. Returns one
+     * {@link VectorBatchAgg} per agg (templates, not per-chunk state), or
+     * {@code null} to punt to the general path.
+     *
+     * <p>
+     * Q30's algebraic fusion ({@link #detectGrandTotalSum}) runs first and wins on
+     * its narrow shape; this path catches the broader Q03 / Q04 / Q07-ish cases.
+     */
+    private static VectorBatchAgg @Nullable [] detectGrandTotalVector(BoundSelect plan, List<BoundExpr> groupExprs,
+            List<BoundAgg> aggs, Table table) {
+        if (plan.where() != null || !groupExprs.isEmpty() || aggs.isEmpty()) {
+            return null;
+        }
+        VectorBatchAgg[] out = new VectorBatchAgg[aggs.size()];
+        for (int i = 0; i < aggs.size(); i++) {
+            BoundAgg a = aggs.get(i);
+            if (a.distinct()) {
+                return null;
+            }
+            if (a.fn() == AggregateFn.COUNT_STAR) {
+                out[i] = new VectorBatchAgg.CountStar();
+                continue;
+            }
+            BoundExpr arg = a.arg();
+            if (!(arg instanceof BoundColumn bc)) {
+                return null;
+            }
+            ColumnType ct = table.columnMeta(bc.index()).type();
+            VectorBatchAgg op;
+            switch (ct) {
+                case I32 -> {
+                    I32Column c = table.i32(bc.index());
+                    if (c.nullable()) {
+                        return null;
+                    }
+                    op = switch (a.fn()) {
+                        case SUM -> new VectorBatchAgg.SumI32(c);
+                        case AVG -> new VectorBatchAgg.AvgI32(c);
+                        case MIN -> new VectorBatchAgg.MinMaxI32(c, true);
+                        case MAX -> new VectorBatchAgg.MinMaxI32(c, false);
+                        default -> null;
+                    };
+                }
+                case I64 -> {
+                    I64Column c = table.i64(bc.index());
+                    if (c.nullable()) {
+                        return null;
+                    }
+                    op = switch (a.fn()) {
+                        case SUM -> new VectorBatchAgg.SumI64(c);
+                        case AVG -> new VectorBatchAgg.AvgI64(c);
+                        case MIN -> new VectorBatchAgg.MinMaxI64(c, true);
+                        case MAX -> new VectorBatchAgg.MinMaxI64(c, false);
+                        default -> null;
+                    };
+                }
+                case F64 -> {
+                    io.jpointdb.core.column.F64Column c = table.f64(bc.index());
+                    if (c.nullable()) {
+                        return null;
+                    }
+                    op = switch (a.fn()) {
+                        case SUM -> new VectorBatchAgg.SumF64(c);
+                        case AVG -> new VectorBatchAgg.AvgF64(c);
+                        default -> null; // MIN/MAX on F64 left for a follow-up
+                    };
+                }
+                default -> {
+                    return null;
+                }
+            }
+            if (op == null) {
+                return null;
+            }
+            out[i] = op;
+        }
+        return out;
+    }
+
+    private static QueryResult executeGrandTotalVector(BoundSelect plan, List<BoundAgg> aggs, long n,
+            VectorBatchAgg[] templates) {
+        int aggCount = aggs.size();
+        VectorBatchAgg[] merged;
+        if (n >= PARALLEL_THRESHOLD) {
+            long[] bounds = chunkBounds(n);
+            int k = bounds.length - 1;
+            @SuppressWarnings("unchecked")
+            ForkJoinTask<VectorBatchAgg[]>[] tasks = new ForkJoinTask[k];
+            for (int c = 0; c < k; c++) {
+                long from = bounds[c];
+                long to = bounds[c + 1];
+                tasks[c] = ForkJoinPool.commonPool().submit(() -> {
+                    VectorBatchAgg[] local = new VectorBatchAgg[aggCount];
+                    for (int j = 0; j < aggCount; j++) {
+                        local[j] = templates[j].forkChunk();
+                        local[j].acceptRange(from, to);
+                    }
+                    return local;
+                });
+            }
+            merged = new VectorBatchAgg[aggCount];
+            for (int j = 0; j < aggCount; j++) {
+                merged[j] = templates[j].forkChunk();
+            }
+            for (ForkJoinTask<VectorBatchAgg[]> t : tasks) {
+                VectorBatchAgg[] part = t.join();
+                for (int j = 0; j < aggCount; j++) {
+                    merged[j].mergeFrom(part[j]);
+                }
+            }
+        } else {
+            merged = new VectorBatchAgg[aggCount];
+            for (int j = 0; j < aggCount; j++) {
+                merged[j] = templates[j].forkChunk();
+                merged[j].acceptRange(0, n);
+            }
+        }
+
+        // Emit a single-row result. Reuse PrecomputedAggregator to keep the
+        // finalize path shape-agnostic.
+        Aggregator[] states = new Aggregator[aggCount];
+        for (int j = 0; j < aggCount; j++) {
+            states[j] = new PrecomputedAggregator(merged[j].result());
+        }
+        List<GroupEntry> groups = List.of(new GroupEntry(List.of(), states));
+        return finalizeAggregated(plan, plan.groupBy(), aggs, groups);
     }
 
     private static long[] sumBatchChunk(I32Column col, long[] offsets, int aggCount, long from, long to) {

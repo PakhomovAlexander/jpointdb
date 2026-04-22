@@ -35,6 +35,19 @@
 
 ## 🔴 Stage 3 — Performance (следующая большая тема)
 
+### Quick-wins из анализа разрыва с DuckDB (сессия 5)
+
+После opt-4 (inline primitive state + slot top-k) total 649 ms / 119 ms DuckDB = **5.44×**. Разобрал per-query, отсортировал по ratio. Следующие точечные правки, каждая даёт >3% на total:
+
+- [ ] **Width≥3 inline primitive GROUP BY** — Q17 (15×), Q19 (25×), Q40 (5×) все попадают в generic HashMap path. Обобщить `LongKeysAggMap` на N-колоночный `long[]`-ключ. Потенциал: −80 ms.
+- [ ] **Нативный DATE / DATETIME (i32 days / i64 micros)** — сейчас EventDate/EventTime хранятся как STRING. Q07 (MIN/MAX EventDate 16×), Q31 (23×), Q37/38/41/43 все платят string-compare за фильтр `WHERE date BETWEEN ... AND ...`. Потенциал: −40 ms.
+- [ ] **Radix-partitioned hash агрегатор** — Q33 всё ещё 58× slower (140 ms на 1M уникальных групп). DuckDB разбивает по хешу ключа на партиции → каждое ядро работает со своей без merge. Потенциал: −100 ms на Q33.
+- [ ] **Literal в GROUP BY → игнорить при shape detection** — Q35 `GROUP BY 1, URL` (12×). Литерал `1` одиночная группа; detectPrimitiveKey должен проигнорить и использовать one-col DICT STRING path. Потенциал: −35 ms.
+- [ ] **Zone-maps (page-level min/max)** — при conversion записывать min/max на каждый 4K-row блок в meta. `MIN/MAX(col)` за O(pages) вместо O(rows). Q07 (16×). Потенциал: −3 ms.
+- [ ] **STRING ORDER BY → radix-sort на UTF-8 байтах** — Q25/Q27 (`ORDER BY EventTime LIMIT 10`) ~8-9× slower. `String.compareTo` на 19-символьных timestamp'ах vs int64-micros radix у DuckDB. Потенциал: −30 ms.
+
+Суммарный потенциал: **−290 ms** → **~360 ms total** ≈ **3× DuckDB**. Подробный анализ разрыва — в `bench/results/summary-session3.md` и коммит `e6a8e90`.
+
 ### Векторизация исполнителя
 - [ ] **Vector batches** (`Batch` с типизированными примитивными массивами + null-mask, размер 4096 строк).
 - [ ] **Vector API / SIMD** через `jdk.incubator.vector`: фильтры по i32/i64/f64, агрегаты `sum`/`count`/`min`/`max`, compare-mask для строкового поиска разделителей.

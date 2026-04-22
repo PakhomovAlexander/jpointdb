@@ -1,6 +1,7 @@
 package io.jpointdb.core.column;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 
@@ -16,5 +17,12 @@ public final class F64Column extends AbstractColumn {
 
     public double get(long i) {
         return data.get(ValueLayout.JAVA_DOUBLE, i * 8);
+    }
+
+    /**
+     * Bulk-read {@code len} doubles starting at {@code startRow} into {@code dst}.
+     */
+    public void readDoubles(long startRow, double[] dst, int len) {
+        MemorySegment.copy(data, ValueLayout.JAVA_DOUBLE, startRow * 8L, dst, 0, len);
     }
 }
