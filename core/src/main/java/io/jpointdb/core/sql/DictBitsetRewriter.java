@@ -4,7 +4,13 @@ import io.jpointdb.core.column.Dictionary;
 import io.jpointdb.core.column.StringColumn;
 import io.jpointdb.core.column.StringColumnWriter;
 import io.jpointdb.core.schema.ColumnType;
-import io.jpointdb.core.sql.BoundAst.*;
+import io.jpointdb.core.sql.BoundAst.BoundBinary;
+import io.jpointdb.core.sql.BoundAst.BoundColumn;
+import io.jpointdb.core.sql.BoundAst.BoundDictBitsetMatch;
+import io.jpointdb.core.sql.BoundAst.BoundExpr;
+import io.jpointdb.core.sql.BoundAst.BoundIsNull;
+import io.jpointdb.core.sql.BoundAst.BoundLiteral;
+import io.jpointdb.core.sql.BoundAst.BoundUnary;
 import io.jpointdb.core.sql.SqlAst.BinaryOp;
 import io.jpointdb.core.table.Table;
 import org.jspecify.annotations.Nullable;
@@ -16,10 +22,12 @@ import org.jspecify.annotations.Nullable;
  * {@code String.compareTo} on ClickBench's date-range filters (Q37/38/41/42/43)
  * and equality filters on small-cardinality STRING columns.
  *
- * <p>Only rewrites leaves; AND/OR composition is left to the executor so this
+ * <p>
+ * Only rewrites leaves; AND/OR composition is left to the executor so this
  * remains a local per-comparison optimization.
  *
- * <p>Gated by {@link #MAX_DICT_SIZE} so we don't build a 1 M-entry bitset for
+ * <p>
+ * Gated by {@link #MAX_DICT_SIZE} so we don't build a 1 M-entry bitset for
  * high-cardinality columns like URL where the per-query walk would cost more
  * than the per-row savings.
  */
@@ -27,8 +35,8 @@ public final class DictBitsetRewriter {
 
     /**
      * Walking a 1 M-entry dict once at bind time costs ~1-3 ms but saves per-row
-     * String materialization/comparison over ~1 M scan rows — break-even ratio
-     * is >100× and bitset memory stays under 2 MB. Skip only pathological dicts.
+     * String materialization/comparison over ~1 M scan rows — break-even ratio is
+     * >100× and bitset memory stays under 2 MB. Skip only pathological dicts.
      */
     private static final int MAX_DICT_SIZE = 2_000_000;
 

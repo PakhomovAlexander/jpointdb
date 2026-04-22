@@ -112,10 +112,11 @@ public final class BoundAst {
      * Precomputed predicate on a DICT-encoded STRING column: {@code bitset[id]}
      * answers whether each dict id satisfies the original string comparison(s).
      * Built at bind time from patterns like {@code col = 'x'}, {@code col <> 'x'},
-     * {@code col >= 'lo' AND col <= 'hi'}. The hot path reads one int (dict id)
-     * and one boolean[] lookup per row — no String allocation, no compareTo.
+     * {@code col >= 'lo' AND col <= 'hi'}. The hot path reads one int (dict id) and
+     * one boolean[] lookup per row — no String allocation, no compareTo.
      *
-     * <p>{@code negated} toggles the stored bitset (used for {@code NOT} / {@code <>}
+     * <p>
+     * {@code negated} toggles the stored bitset (used for {@code NOT} / {@code <>}
      * without rewriting the array).
      */
     @SuppressWarnings("ArrayRecordComponent")

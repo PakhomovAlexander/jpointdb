@@ -306,6 +306,25 @@ class QueryEngineTest {
         }
     }
 
+    @Test
+    void dictBitsetRewriteRange(@TempDir Path dir) throws IOException {
+        // Exercises DictBitsetRewriter on STRING DICT column range predicate.
+        try (Table t = convertAndOpen(dir, "2013-07-01\n2013-07-15\n2013-07-31\n2013-08-01\n", List.of("d"))) {
+            QueryResult r = QueryEngine.run(t,
+                    "SELECT COUNT(*) FROM " + tableName(t) + " WHERE d >= '2013-07-01' AND d <= '2013-07-31'");
+            assertEquals(3L, r.rows().get(0)[0]);
+        }
+    }
+
+    @Test
+    void dictBitsetRewriteEquality(@TempDir Path dir) throws IOException {
+        try (Table t = convertAndOpen(dir, "a\nb\na\nc\na\n", List.of("ch"))) {
+            String tbl = tableName(t);
+            assertEquals(3L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + tbl + " WHERE ch = 'a'").rows().get(0)[0]);
+            assertEquals(2L, QueryEngine.run(t, "SELECT COUNT(*) FROM " + tbl + " WHERE ch <> 'a'").rows().get(0)[0]);
+        }
+    }
+
     private static String tableName(Table t) {
         String name = t.dir().getFileName().toString();
         return name.endsWith(".jpdb") ? name.substring(0, name.length() - 5) : name;
