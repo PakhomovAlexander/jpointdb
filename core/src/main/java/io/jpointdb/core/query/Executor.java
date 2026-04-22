@@ -1075,9 +1075,190 @@ public final class Executor {
      *     materialize only K winners (boxing + evalPostAgg for ~10 rows)
      * </pre>
      */
+    /**
+     * For high-cardinality GROUP BY, merge chunks radix-style in parallel
+     * partitions.
+     */
+    private static final int RADIX_THRESHOLD = 200_000;
+
+    private static int nextPowerOfTwoPartitions(int chunkCount) {
+        // Prefer P = #cores rounded to power-of-2 (for mask arithmetic).
+        int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int target = Math.min(cores, chunkCount);
+        int p = 1;
+        while (p * 2 <= target) {
+            p *= 2;
+        }
+        return Math.max(2, p);
+    }
+
+    /**
+     * Partition all chunk entries by {@code hash(key) & (P-1)} into {@code P}
+     * independent result maps, each built in parallel. Every key lands in exactly
+     * one partition so the per-partition merge needs no cross-thread
+     * synchronization; downstream top-k then runs per partition in parallel.
+     *
+     * <p>
+     * Unit of work per partition thread: walk {@code T × chunk_size} source slots,
+     * test partition membership with a masked hash, insert the ~1/P that match.
+     * Dominant cost is {@code T × chunk_size} hash calls and {@code N/P}
+     * destination-map inserts.
+     */
+    private static PrimitiveAggMap[] mergeChunksRadix(List<PrimitiveAggMap> chunks, int p, PrimitiveKeyShape keyShape,
+            SimpleAggShape aggShape, int totalHint) {
+        int width = keyShape.width();
+        int estPerPart = Math.max(64, (totalHint + p - 1) / p);
+        int pMask = p - 1;
+        PrimitiveAggMap[] result = new PrimitiveAggMap[p];
+        @SuppressWarnings("unchecked")
+        ForkJoinTask<PrimitiveAggMap>[] tasks = new ForkJoinTask[p];
+        for (int i = 0; i < p; i++) {
+            final int part = i;
+            tasks[i] = ForkJoinPool.commonPool().submit(() -> {
+                PrimitiveAggMap out = new PrimitiveAggMap(width, estPerPart, aggShape.mapOps(), aggShape.longFields(),
+                        aggShape.doubleFields());
+                out.ensureCapacity(estPerPart);
+                if (width == 1) {
+                    for (PrimitiveAggMap chunk : chunks) {
+                        int[] slots = chunk.occupiedSlots();
+                        int nn = chunk.nonNullSize();
+                        for (int j = 0; j < nn; j++) {
+                            int srcSlot = slots[j];
+                            long k = chunk.keyAt(srcSlot, 0);
+                            if ((int) (PrimitiveAggMap.hashKey(k) & pMask) != part) {
+                                continue;
+                            }
+                            int dstSlot = out.getOrCreateSlot1(k);
+                            out.foldSlotFrom(dstSlot, chunk, srcSlot);
+                        }
+                    }
+                } else {
+                    for (PrimitiveAggMap chunk : chunks) {
+                        int[] slots = chunk.occupiedSlots();
+                        int nn = chunk.nonNullSize();
+                        for (int j = 0; j < nn; j++) {
+                            int srcSlot = slots[j];
+                            long a = chunk.keyAt(srcSlot, 0);
+                            long b = chunk.keyAt(srcSlot, 1);
+                            if ((int) (PrimitiveAggMap.hashKey(a, b) & pMask) != part) {
+                                continue;
+                            }
+                            int dstSlot = out.getOrCreateSlot2(a, b);
+                            out.foldSlotFrom(dstSlot, chunk, srcSlot);
+                        }
+                    }
+                }
+                return out;
+            });
+        }
+        for (int i = 0; i < p; i++) {
+            result[i] = tasks[i].join();
+        }
+        return result;
+    }
+
+    /**
+     * Top-k over P independent partitions. Each partition picks its own local top-k
+     * in parallel; the P × K candidates then go through a second-level top-k to
+     * produce the global top-K, and only those winners get boxed + materialized.
+     */
+    private static QueryResult finalizeRadixInline(BoundSelect plan, List<BoundExpr> groupExprs, List<BoundAgg> aggs,
+            PrimitiveKeyShape keyShape, SimpleAggShape aggShape, SlotOrderShape orderShape,
+            PrimitiveAggMap[] partitions, Table table) {
+        long limit = plan.limit() == null ? Long.MAX_VALUE : plan.limit();
+        long offset = plan.offset() == null ? 0 : plan.offset();
+        long bound = Math.min((long) Integer.MAX_VALUE, offset + Math.min(limit, Integer.MAX_VALUE - offset));
+
+        int totalSize = 0;
+        for (PrimitiveAggMap m : partitions) {
+            totalSize += m.nonNullSize();
+        }
+        int k = (int) Math.min((long) totalSize, Math.max(0L, bound));
+
+        // Parallel: each partition computes its local top-k (or full sort if
+        // partition is smaller than k).
+        int p = partitions.length;
+        @SuppressWarnings("unchecked")
+        ForkJoinTask<int[]>[] topTasks = new ForkJoinTask[p];
+        int perPartK = k;
+        for (int i = 0; i < p; i++) {
+            final PrimitiveAggMap part = partitions[i];
+            topTasks[i] = ForkJoinPool.commonPool().submit(() -> {
+                int sz = part.nonNullSize();
+                int localK = Math.min(sz, perPartK);
+                if (localK == 0) {
+                    return new int[0];
+                }
+                if (localK >= sz) {
+                    return sortAllSlots(part, orderShape);
+                }
+                return selectTopKSlots(part, orderShape, localK);
+            });
+        }
+
+        // Collect per-partition winners — each carries (partition index, slot id).
+        int[][] partWinners = new int[p][];
+        int globalCount = 0;
+        for (int i = 0; i < p; i++) {
+            partWinners[i] = topTasks[i].join();
+            globalCount += partWinners[i].length;
+        }
+
+        // Build a combined candidate list and run a final top-k / sort.
+        SlotLongExtractor[] extractors = orderShape.extractors();
+        boolean[] desc = orderShape.desc();
+        int orderN = extractors.length;
+        // Flatten candidates into (mapIdx, slot, orderVals) parallel arrays.
+        int[] candMap = new int[globalCount];
+        int[] candSlot = new int[globalCount];
+        long[] candOrder =
+                new long[(long) globalCount * orderN > Integer.MAX_VALUE ? Integer.MAX_VALUE : globalCount * orderN];
+        int w = 0;
+        for (int i = 0; i < p; i++) {
+            int[] slots = partWinners[i];
+            PrimitiveAggMap m = partitions[i];
+            for (int s : slots) {
+                candMap[w] = i;
+                candSlot[w] = s;
+                for (int o = 0; o < orderN; o++) {
+                    candOrder[w * orderN + o] = extractors[o].extract(m, s);
+                }
+                w++;
+            }
+        }
+
+        // Sort the P × K candidates by order vals using the same comparator.
+        Integer[] idx = new Integer[globalCount];
+        for (int i = 0; i < globalCount; i++) {
+            idx[i] = i;
+        }
+        Arrays.sort(idx, (a, b) -> compareForTopK(candOrder, a * orderN, candOrder, b * orderN, orderN, desc));
+
+        int fromIdx = (int) Math.min((long) globalCount, offset);
+        int toIdx = (int) Math.min((long) globalCount, fromIdx + Math.min(limit, Integer.MAX_VALUE - fromIdx));
+        List<@Nullable Object[]> rows = new ArrayList<>(toIdx - fromIdx);
+        List<BoundSelectItem> items = plan.items();
+        for (int i = fromIdx; i < toIdx; i++) {
+            int id = idx[i];
+            int mapIdx = candMap[id];
+            int slot = candSlot[id];
+            PrimitiveAggMap m = partitions[mapIdx];
+            List<Object> key = buildKeyFromSlot(m, slot, keyShape, table);
+            Aggregator[] states = synthesizeStates(m, slot, aggShape.accepts());
+            @Nullable
+            Object[] row = new @Nullable Object[items.size()];
+            for (int j = 0; j < items.size(); j++) {
+                row[j] = evalPostAgg(items.get(j).expr(), groupExprs, key, aggs, states);
+            }
+            rows.add(row);
+        }
+        return toResult(plan, rows);
+    }
+
     private static QueryResult executeAggregatedInline(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
             List<BoundAgg> aggs, long n, PrimitiveKeyShape keyShape, SimpleAggShape aggShape,
             SlotOrderShape orderShape) {
+        PrimitiveAggMap[] partitions = null;
         PrimitiveAggMap merged;
         if (n >= PARALLEL_THRESHOLD) {
             long[] bounds = chunkBounds(n);
@@ -1092,19 +1273,35 @@ public final class Executor {
             }
             List<PrimitiveAggMap> chunks = new ArrayList<>(kBounds);
             int totalHint = 0;
+            boolean anyNull = false;
             for (ForkJoinTask<PrimitiveAggMap> t : tasks) {
                 PrimitiveAggMap m = t.join();
                 chunks.add(m);
                 totalHint += m.size();
+                anyNull |= m.hasNull();
             }
-            merged = new PrimitiveAggMap(keyShape.width(), totalHint, aggShape.mapOps(), aggShape.longFields(),
-                    aggShape.doubleFields());
-            merged.ensureCapacity(totalHint);
-            for (PrimitiveAggMap m : chunks) {
-                merged.merge(m);
+            // Radix-parallel merge for big result sets — avoids the O(totalHint)
+            // sequential merge through a single map. Null groups disable it
+            // (null is in a separate slot per map, doesn't belong to any bucket).
+            if (totalHint >= RADIX_THRESHOLD && !anyNull) {
+                int p = nextPowerOfTwoPartitions(kBounds);
+                partitions = mergeChunksRadix(chunks, p, keyShape, aggShape, totalHint);
+                merged = partitions[0]; // only used for hasNull; we take radix path below
+            } else {
+                merged = new PrimitiveAggMap(keyShape.width(), totalHint, aggShape.mapOps(), aggShape.longFields(),
+                        aggShape.doubleFields());
+                merged.ensureCapacity(totalHint);
+                for (PrimitiveAggMap m : chunks) {
+                    merged.merge(m);
+                }
             }
         } else {
             merged = scanAggChunkInline(plan, table, keyShape, aggShape, 0, n);
+        }
+
+        // Radix path: run top-k per partition in parallel, merge P × K candidates.
+        if (partitions != null) {
+            return finalizeRadixInline(plan, groupExprs, aggs, keyShape, aggShape, orderShape, partitions, table);
         }
 
         // Null-group primitive heap is tricky (null keys don't compare as longs);

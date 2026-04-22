@@ -251,6 +251,16 @@ final class PrimitiveAggMap {
         }
     }
 
+    /**
+     * Fold src's state at {@code srcSlot} into this map's {@code dstSlot}. Every op
+     * is commutative-associative over its fields, so this is a plain field-by-field
+     * add — used by both {@link #merge} and by the radix partitioning path that
+     * re-reads source slots into per-partition targets.
+     */
+    void foldSlotFrom(int dstSlot, PrimitiveAggMap src, int srcSlot) {
+        foldSlot(dstSlot, src, srcSlot);
+    }
+
     private void foldSlot(int dstSlot, PrimitiveAggMap src, int srcSlot) {
         for (AggOp op : ops) {
             switch (op.kind) {
@@ -347,5 +357,17 @@ final class PrimitiveAggMap {
     private static long mix2(long a, long b) {
         long h = a * 0x9E3779B97F4A7C15L + b;
         return mix(h);
+    }
+
+    /**
+     * Hash a key the same way this map does internally — exposed so radix
+     * partitioning can bucketize source entries using the identical distribution.
+     */
+    static long hashKey(long a) {
+        return mix(a);
+    }
+
+    static long hashKey(long a, long b) {
+        return mix2(a, b);
     }
 }
