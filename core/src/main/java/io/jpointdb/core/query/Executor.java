@@ -870,7 +870,19 @@ public final class Executor {
         }
         PrimitiveAggMap.AggOp[] mapOps = new PrimitiveAggMap.AggOp[aggs.size()];
         InlineAccept[] accepts = new InlineAccept[aggs.size()];
-        int lf = 0;
+        // If the query has COUNT(*) alongside AVG(<non-null col>), the AVG's
+        // per-slot counter is identical to COUNT(*)'s. Share the long field
+        // so AVG's accept only writes the double sum — one slot write per row
+        // instead of two. On Q33-shaped queries this cut AVG cost ~in half.
+        boolean hasCountStar = false;
+        for (BoundAgg a : aggs) {
+            if (a.fn() == AggregateFn.COUNT_STAR && !a.distinct()) {
+                hasCountStar = true;
+                break;
+            }
+        }
+        int sharedCountIdx = hasCountStar ? 0 : -1;
+        int lf = hasCountStar ? 1 : 0;
         int df = 0;
         for (int i = 0; i < aggs.size(); i++) {
             BoundAgg a = aggs.get(i);
@@ -878,7 +890,7 @@ public final class Executor {
                 return null;
             }
             if (a.fn() == AggregateFn.COUNT_STAR) {
-                final int longIdx = lf++;
+                final int longIdx = sharedCountIdx; // reserved at slot 0
                 mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.COUNT_STAR, longIdx, -1);
                 accepts[i] = new InlineAccept() {
                     @Override
@@ -922,22 +934,44 @@ public final class Executor {
                         }
                     };
                 } else {
+                    // AVG_LONG over non-null col reuses COUNT(*)'s long slot
+                    // when present — see sharedCountIdx note above.
                     final int doubleIdx = df++;
-                    final int longIdx = lf++;
-                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_LONG, longIdx, doubleIdx);
-                    accepts[i] = new InlineAccept() {
-                        @Override
-                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
-                            doubleFields[doubleIdx][slot] += c.get(row);
-                            longFields[longIdx][slot]++;
-                        }
+                    final boolean sharesCount = sharedCountIdx >= 0;
+                    final int longIdx = sharesCount ? sharedCountIdx : lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(
+                            sharesCount ? PrimitiveAggMap.AggOp.Kind.AVG_LONG_SHARED
+                                        : PrimitiveAggMap.AggOp.Kind.AVG_LONG,
+                            longIdx, doubleIdx);
+                    if (sharesCount) {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                                // counter is maintained by COUNT(*)
+                            }
 
-                        @Override
-                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
-                            long cnt = map.longField(longIdx)[slot];
-                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
-                        }
-                    };
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    } else {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                                longFields[longIdx][slot]++;
+                            }
+
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    }
                 }
             } else if (ct == ColumnType.I64) {
                 I64Column c = table.i64(bc.index());
@@ -960,21 +994,40 @@ public final class Executor {
                     };
                 } else {
                     final int doubleIdx = df++;
-                    final int longIdx = lf++;
-                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_LONG, longIdx, doubleIdx);
-                    accepts[i] = new InlineAccept() {
-                        @Override
-                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
-                            doubleFields[doubleIdx][slot] += c.get(row);
-                            longFields[longIdx][slot]++;
-                        }
+                    final boolean sharesCount = sharedCountIdx >= 0;
+                    final int longIdx = sharesCount ? sharedCountIdx : lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(
+                            sharesCount ? PrimitiveAggMap.AggOp.Kind.AVG_LONG_SHARED
+                                        : PrimitiveAggMap.AggOp.Kind.AVG_LONG,
+                            longIdx, doubleIdx);
+                    if (sharesCount) {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                            }
 
-                        @Override
-                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
-                            long cnt = map.longField(longIdx)[slot];
-                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
-                        }
-                    };
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    } else {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                                longFields[longIdx][slot]++;
+                            }
+
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    }
                 }
             } else if (ct == ColumnType.F64) {
                 io.jpointdb.core.column.F64Column c = table.f64(bc.index());
@@ -996,21 +1049,40 @@ public final class Executor {
                         }
                     };
                 } else {
-                    final int longIdx = lf++;
-                    mapOps[i] = new PrimitiveAggMap.AggOp(PrimitiveAggMap.AggOp.Kind.AVG_DOUBLE, longIdx, doubleIdx);
-                    accepts[i] = new InlineAccept() {
-                        @Override
-                        public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
-                            doubleFields[doubleIdx][slot] += c.get(row);
-                            longFields[longIdx][slot]++;
-                        }
+                    final boolean sharesCount = sharedCountIdx >= 0;
+                    final int longIdx = sharesCount ? sharedCountIdx : lf++;
+                    mapOps[i] = new PrimitiveAggMap.AggOp(
+                            sharesCount ? PrimitiveAggMap.AggOp.Kind.AVG_DOUBLE_SHARED
+                                        : PrimitiveAggMap.AggOp.Kind.AVG_DOUBLE,
+                            longIdx, doubleIdx);
+                    if (sharesCount) {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                            }
 
-                        @Override
-                        public @Nullable Object result(PrimitiveAggMap map, int slot) {
-                            long cnt = map.longField(longIdx)[slot];
-                            return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
-                        }
-                    };
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    } else {
+                        accepts[i] = new InlineAccept() {
+                            @Override
+                            public void acceptRow(long[][] longFields, double[][] doubleFields, int slot, long row) {
+                                doubleFields[doubleIdx][slot] += c.get(row);
+                                longFields[longIdx][slot]++;
+                            }
+
+                            @Override
+                            public @Nullable Object result(PrimitiveAggMap map, int slot) {
+                                long cnt = map.longField(longIdx)[slot];
+                                return cnt == 0 ? null : map.doubleField(doubleIdx)[slot] / cnt;
+                            }
+                        };
+                    }
                 }
             } else {
                 return null;

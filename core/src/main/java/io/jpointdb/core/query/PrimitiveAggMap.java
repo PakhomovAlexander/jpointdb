@@ -24,7 +24,14 @@ final class PrimitiveAggMap {
     /** One primitive aggregator's layout inside the flat state. */
     static final class AggOp {
         enum Kind {
-            COUNT_STAR, SUM_LONG, AVG_LONG, SUM_DOUBLE, AVG_DOUBLE
+            COUNT_STAR, SUM_LONG, AVG_LONG, SUM_DOUBLE, AVG_DOUBLE,
+            /**
+             * AVG over a non-nullable column whose counter is shared with an
+             * existing COUNT(*). The fold must skip the longField update
+             * (COUNT_STAR handles it) — double-adding the same counter during
+             * chunk merge would otherwise inflate the total.
+             */
+            AVG_LONG_SHARED, AVG_DOUBLE_SHARED
         }
 
         final Kind kind;
@@ -373,6 +380,10 @@ final class PrimitiveAggMap {
                 case AVG_LONG, AVG_DOUBLE -> {
                     doubleFields[op.doubleField][dstSlot] += src.doubleFields[op.doubleField][srcSlot];
                     longFields[op.longField][dstSlot] += src.longFields[op.longField][srcSlot];
+                }
+                case AVG_LONG_SHARED, AVG_DOUBLE_SHARED -> {
+                    // Counter is merged by COUNT_STAR; fold only the sum.
+                    doubleFields[op.doubleField][dstSlot] += src.doubleFields[op.doubleField][srcSlot];
                 }
             }
         }
