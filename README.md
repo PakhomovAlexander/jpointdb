@@ -60,5 +60,6 @@ One-shot query from CLI:
 
 ## Further reading
 
+- [`HACKING.md`](HACKING.md) — developer-oriented tour: repo layout, how a query flows through parse → bind → rewrite → execute, the fast-path cascade in `Executor`, where the caches live, how to benchmark and profile your changes.
 - [`BACKLOG.md`](BACKLOG.md) — everything deferred: Stage 3 performance (vector batches, SIMD, parallel scan, hash agg), engine features (native DATE/DATETIME, JOIN, windows), dev ergonomics.
 - [`AGENTS.md`](AGENTS.md) — conventions and commands for AI agents working on this repo.
