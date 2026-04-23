@@ -1123,16 +1123,34 @@ public final class Executor {
      * synchronization; downstream top-k then runs per partition in parallel.
      *
      * <p>
-     * Unit of work per partition thread: walk {@code T × chunk_size} source slots,
-     * test partition membership with a masked hash, insert the ~1/P that match.
-     * Dominant cost is {@code T × chunk_size} hash calls and {@code N/P}
-     * destination-map inserts.
+     * Two phases:
+     * <ol>
+     * <li>Per chunk (parallel): bucket the chunk's occupied slots into
+     * {@code int[P][]} arrays by {@code hash(key) & (P-1)}, so later merges
+     * skip rescanning the 7/8 of slots that don't belong to their partition.</li>
+     * <li>Per partition (parallel): read only its own pre-bucketed slots from
+     * each chunk, insert into the partition's result map.</li>
+     * </ol>
      */
     private static PrimitiveAggMap[] mergeChunksRadix(List<PrimitiveAggMap> chunks, int p, PrimitiveKeyShape keyShape,
             SimpleAggShape aggShape, int totalHint) {
         int width = keyShape.width();
         int estPerPart = Math.max(64, (totalHint + p - 1) / p);
         int pMask = p - 1;
+        int chunkCount = chunks.size();
+        // Phase 1: per-chunk partition-by-hash. Each task returns int[P][] of
+        // src slot indices grouped by (hash & pMask).
+        @SuppressWarnings("unchecked")
+        ForkJoinTask<int[][]>[] partTasks = new ForkJoinTask[chunkCount];
+        for (int i = 0; i < chunkCount; i++) {
+            final PrimitiveAggMap chunk = chunks.get(i);
+            partTasks[i] = ForkJoinPool.commonPool().submit(() -> partitionChunkSlots(chunk, width, pMask));
+        }
+        int[][][] perChunkPartSlots = new int[chunkCount][][];
+        for (int i = 0; i < chunkCount; i++) {
+            perChunkPartSlots[i] = partTasks[i].join();
+        }
+        // Phase 2: per-partition insert. Each partition reads only its slots.
         PrimitiveAggMap[] result = new PrimitiveAggMap[p];
         @SuppressWarnings("unchecked")
         ForkJoinTask<PrimitiveAggMap>[] tasks = new ForkJoinTask[p];
@@ -1142,63 +1160,40 @@ public final class Executor {
                 PrimitiveAggMap out = new PrimitiveAggMap(width, estPerPart, aggShape.mapOps(), aggShape.longFields(),
                         aggShape.doubleFields());
                 out.ensureCapacity(estPerPart);
-                if (width == 1) {
-                    for (PrimitiveAggMap chunk : chunks) {
-                        int[] slots = chunk.occupiedSlots();
-                        int nn = chunk.nonNullSize();
+                long[] scratch = width >= 4 ? new long[width] : new long[0];
+                for (int ci = 0; ci < chunkCount; ci++) {
+                    PrimitiveAggMap chunk = chunks.get(ci);
+                    int[] partSlots = perChunkPartSlots[ci][part];
+                    int nn = partSlots.length;
+                    if (width == 1) {
                         for (int j = 0; j < nn; j++) {
-                            int srcSlot = slots[j];
+                            int srcSlot = partSlots[j];
                             long k = chunk.keyAt(srcSlot, 0);
-                            if ((int) (PrimitiveAggMap.hashKey(k) & pMask) != part) {
-                                continue;
-                            }
                             int dstSlot = out.getOrCreateSlot1(k);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
-                    }
-                } else if (width == 2) {
-                    for (PrimitiveAggMap chunk : chunks) {
-                        int[] slots = chunk.occupiedSlots();
-                        int nn = chunk.nonNullSize();
+                    } else if (width == 2) {
                         for (int j = 0; j < nn; j++) {
-                            int srcSlot = slots[j];
+                            int srcSlot = partSlots[j];
                             long a = chunk.keyAt(srcSlot, 0);
                             long b = chunk.keyAt(srcSlot, 1);
-                            if ((int) (PrimitiveAggMap.hashKey(a, b) & pMask) != part) {
-                                continue;
-                            }
                             int dstSlot = out.getOrCreateSlot2(a, b);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
-                    }
-                } else if (width == 3) {
-                    for (PrimitiveAggMap chunk : chunks) {
-                        int[] slots = chunk.occupiedSlots();
-                        int nn = chunk.nonNullSize();
+                    } else if (width == 3) {
                         for (int j = 0; j < nn; j++) {
-                            int srcSlot = slots[j];
+                            int srcSlot = partSlots[j];
                             long a = chunk.keyAt(srcSlot, 0);
                             long b = chunk.keyAt(srcSlot, 1);
                             long c = chunk.keyAt(srcSlot, 2);
-                            if ((int) (PrimitiveAggMap.hashKey(a, b, c) & pMask) != part) {
-                                continue;
-                            }
                             int dstSlot = out.getOrCreateSlot3(a, b, c);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
-                    }
-                } else { // width >= 4
-                    long[] scratch = new long[width];
-                    for (PrimitiveAggMap chunk : chunks) {
-                        int[] slots = chunk.occupiedSlots();
-                        int nn = chunk.nonNullSize();
+                    } else { // width >= 4
                         for (int j = 0; j < nn; j++) {
-                            int srcSlot = slots[j];
+                            int srcSlot = partSlots[j];
                             for (int k = 0; k < width; k++) {
                                 scratch[k] = chunk.keyAt(srcSlot, k);
-                            }
-                            if ((int) (PrimitiveAggMap.hashKeyN(scratch) & pMask) != part) {
-                                continue;
                             }
                             int dstSlot = out.getOrCreateSlotN(scratch);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
@@ -1212,6 +1207,54 @@ public final class Executor {
             result[i] = tasks[i].join();
         }
         return result;
+    }
+
+    /**
+     * Bucket a chunk's occupied slots by {@code hash(key) & (P-1)}. Returns
+     * {@code int[P][]} where entry {@code [p]} is the list of src slots that
+     * fall in partition {@code p}.
+     */
+    private static int[][] partitionChunkSlots(PrimitiveAggMap chunk, int width, int pMask) {
+        int[] src = chunk.occupiedSlots();
+        int nn = chunk.nonNullSize();
+        int p = pMask + 1;
+        int[] sizes = new int[p];
+        // First pass: count per-partition sizes.
+        long[] scratch = width >= 4 ? new long[width] : new long[0];
+        for (int j = 0; j < nn; j++) {
+            int srcSlot = src[j];
+            int part = hashPartFor(chunk, srcSlot, width, pMask, scratch);
+            sizes[part]++;
+        }
+        int[][] out = new int[p][];
+        int[] offsets = new int[p];
+        for (int i = 0; i < p; i++) {
+            out[i] = new int[sizes[i]];
+        }
+        // Second pass: fill arrays.
+        for (int j = 0; j < nn; j++) {
+            int srcSlot = src[j];
+            int part = hashPartFor(chunk, srcSlot, width, pMask, scratch);
+            out[part][offsets[part]++] = srcSlot;
+        }
+        return out;
+    }
+
+    private static int hashPartFor(PrimitiveAggMap chunk, int srcSlot, int width, int pMask, long[] scratch) {
+        long h;
+        switch (width) {
+            case 1 -> h = PrimitiveAggMap.hashKey(chunk.keyAt(srcSlot, 0));
+            case 2 -> h = PrimitiveAggMap.hashKey(chunk.keyAt(srcSlot, 0), chunk.keyAt(srcSlot, 1));
+            case 3 -> h = PrimitiveAggMap.hashKey(chunk.keyAt(srcSlot, 0), chunk.keyAt(srcSlot, 1),
+                    chunk.keyAt(srcSlot, 2));
+            default -> {
+                for (int k = 0; k < width; k++) {
+                    scratch[k] = chunk.keyAt(srcSlot, k);
+                }
+                h = PrimitiveAggMap.hashKeyN(scratch);
+            }
+        }
+        return (int) (h & pMask);
     }
 
     /**
