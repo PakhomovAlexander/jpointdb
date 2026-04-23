@@ -1168,7 +1168,7 @@ public final class Executor {
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
                     }
-                } else { // width == 3
+                } else if (width == 3) {
                     for (PrimitiveAggMap chunk : chunks) {
                         int[] slots = chunk.occupiedSlots();
                         int nn = chunk.nonNullSize();
@@ -1181,6 +1181,23 @@ public final class Executor {
                                 continue;
                             }
                             int dstSlot = out.getOrCreateSlot3(a, b, c);
+                            out.foldSlotFrom(dstSlot, chunk, srcSlot);
+                        }
+                    }
+                } else { // width >= 4
+                    long[] scratch = new long[width];
+                    for (PrimitiveAggMap chunk : chunks) {
+                        int[] slots = chunk.occupiedSlots();
+                        int nn = chunk.nonNullSize();
+                        for (int j = 0; j < nn; j++) {
+                            int srcSlot = slots[j];
+                            for (int k = 0; k < width; k++) {
+                                scratch[k] = chunk.keyAt(srcSlot, k);
+                            }
+                            if ((int) (PrimitiveAggMap.hashKeyN(scratch) & pMask) != part) {
+                                continue;
+                            }
+                            int dstSlot = out.getOrCreateSlotN(scratch);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
                     }
@@ -1769,7 +1786,7 @@ public final class Executor {
                     accepts[i].acceptRow(lf, df, slot, r);
                 }
             }
-        } else { // width == 3
+        } else if (keyShape.width() == 3) {
             LongKeyReader reader1 = keyReader(table, keyShape, 1);
             LongKeyReader reader2 = keyReader(table, keyShape, 2);
             for (long r = from; r < to; r++) {
@@ -1781,6 +1798,41 @@ public final class Executor {
                     slot = map.getOrCreateNullSlot();
                 } else {
                     slot = map.getOrCreateSlot3(reader0.keyAt(r), reader1.keyAt(r), reader2.keyAt(r));
+                }
+                if (map.capacity() != cap) {
+                    lf = map.longFields;
+                    df = map.doubleFields;
+                    cap = map.capacity();
+                }
+                for (int i = 0; i < accepts.length; i++) {
+                    accepts[i].acceptRow(lf, df, slot, r);
+                }
+            }
+        } else { // width >= 4
+            int w = keyShape.width();
+            LongKeyReader[] readers = new LongKeyReader[w];
+            readers[0] = reader0;
+            for (int i = 1; i < w; i++) {
+                readers[i] = keyReader(table, keyShape, i);
+            }
+            long[] scratch = new long[w];
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                int slot;
+                boolean anyNull = false;
+                for (int i = 0; i < w; i++) {
+                    if (readers[i].isNullAt(r)) {
+                        anyNull = true;
+                        break;
+                    }
+                    scratch[i] = readers[i].keyAt(r);
+                }
+                if (anyNull) {
+                    slot = map.getOrCreateNullSlot();
+                } else {
+                    slot = map.getOrCreateSlotN(scratch);
                 }
                 if (map.capacity() != cap) {
                     lf = map.longFields;
@@ -1844,36 +1896,57 @@ public final class Executor {
                 derivedExprs[i] = e;
             }
         }
-        if (colCount < 1 || colCount > 3) {
+        // Promote any column referenced only inside derived exprs up to a
+        // direct-key slot so we can hash by its raw value. Without this,
+        // CASE / etc. that bring in a new column (e.g. Q40's Referer) would
+        // fall through to the generic boxed path even when the rest of the
+        // GROUP BY is primitive.
+        if (derivedExprs != null) {
+            for (int i = 0; i < g; i++) {
+                BoundExpr d = derivedExprs[i];
+                if (d == null) {
+                    continue;
+                }
+                colCount = promoteRefs(d, directColToKey, colCount);
+            }
+        }
+        if (colCount < 1 || colCount > 5) {
             return null;
         }
         int[] cols = new int[colCount];
         KeyKind[] kinds = new KeyKind[colCount];
         long[][] dictMaps = null;
         String[][] truncDicts = null;
+        // Fill direct-column key slots (covers every entry in directColToKey,
+        // including slots promoted from inside derived exprs that have no
+        // corresponding top-level BoundColumn groupExpr).
+        for (java.util.Map.Entry<Integer, Integer> entry : directColToKey.entrySet()) {
+            int columnIdx = entry.getKey();
+            int ki = entry.getValue();
+            ColumnType t = table.columnMeta(columnIdx).type();
+            if (t == ColumnType.I32) {
+                kinds[ki] = KeyKind.I32;
+            } else if (t == ColumnType.I64) {
+                kinds[ki] = KeyKind.I64;
+            } else if (t == ColumnType.STRING
+                    && table.string(columnIdx).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                kinds[ki] = KeyKind.DICT_STRING;
+            } else {
+                return null;
+            }
+            cols[ki] = columnIdx;
+        }
+        // Fill extract / date_trunc key slots, which are reserved per top-level
+        // groupExpr (distinct from any direct-column slot).
         for (int i = 0; i < g; i++) {
             int ki = exprToKey[i];
             if (ki < 0) {
                 continue;
             }
-            if (cols[ki] != 0 || kinds[ki] != null) {
-                // Already filled by an earlier duplicate; skip.
-                continue;
-            }
             BoundExpr e = groupExprs.get(i);
-            if (e instanceof BoundColumn bc) {
-                ColumnType t = table.columnMeta(bc.index()).type();
-                if (t == ColumnType.I32) {
-                    kinds[ki] = KeyKind.I32;
-                } else if (t == ColumnType.I64) {
-                    kinds[ki] = KeyKind.I64;
-                } else if (t == ColumnType.STRING
-                        && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
-                    kinds[ki] = KeyKind.DICT_STRING;
-                } else {
-                    return null;
-                }
-                cols[ki] = bc.index();
+            if (e instanceof BoundColumn) {
+                // Already filled by the directColToKey pass above.
+                continue;
             } else if (e instanceof BoundScalarCall sc) {
                 int extractCol = extractOverDictString(sc, table);
                 if (extractCol >= 0) {
@@ -1935,6 +2008,69 @@ public final class Executor {
      * materialize time from stored raw keys. Rejects aggregates, subqueries,
      * and anything whose column refs aren't all tracked.
      */
+    /**
+     * Walks a derived expression and adds every {@link BoundColumn} reference
+     * that isn't already tracked in {@code directColToKey} as a new direct-key
+     * slot. Returns the updated slot count. Used when a {@code CASE} / binary
+     * expression in GROUP BY pulls in a column that wasn't grouped directly
+     * elsewhere — the row's raw value still needs to be in the hash key so
+     * distinct rows don't collapse into the wrong group at materialize.
+     */
+    private static int promoteRefs(BoundExpr e, java.util.HashMap<Integer, Integer> directColToKey, int colCount) {
+        switch (e) {
+            case BoundColumn c -> {
+                if (!directColToKey.containsKey(c.index())) {
+                    directColToKey.put(c.index(), colCount);
+                    colCount++;
+                }
+            }
+            case BoundUnary u -> {
+                return promoteRefs(u.operand(), directColToKey, colCount);
+            }
+            case BoundBinary b -> {
+                colCount = promoteRefs(b.left(), directColToKey, colCount);
+                colCount = promoteRefs(b.right(), directColToKey, colCount);
+            }
+            case BoundIsNull n -> {
+                return promoteRefs(n.operand(), directColToKey, colCount);
+            }
+            case BoundLike l -> {
+                colCount = promoteRefs(l.value(), directColToKey, colCount);
+                colCount = promoteRefs(l.pattern(), directColToKey, colCount);
+            }
+            case BoundInList il -> {
+                colCount = promoteRefs(il.value(), directColToKey, colCount);
+                for (BoundExpr item : il.items()) {
+                    colCount = promoteRefs(item, directColToKey, colCount);
+                }
+            }
+            case BoundCase c -> {
+                for (BoundWhen w : c.whens()) {
+                    colCount = promoteRefs(w.when(), directColToKey, colCount);
+                    colCount = promoteRefs(w.then(), directColToKey, colCount);
+                }
+                if (c.elseExpr() != null) {
+                    colCount = promoteRefs(c.elseExpr(), directColToKey, colCount);
+                }
+            }
+            case BoundScalarCall sc -> {
+                for (BoundExpr arg : sc.args()) {
+                    colCount = promoteRefs(arg, directColToKey, colCount);
+                }
+            }
+            case BoundLiteral ignored -> {
+                // no column refs
+            }
+            case BoundAgg ignored -> {
+                // aggregates don't belong in GROUP BY; detection earlier should reject
+            }
+            case BoundDictBitsetMatch ignored -> {
+                // only appears in WHERE, not GROUP BY
+            }
+        }
+        return colCount;
+    }
+
     private static boolean dependsOnlyOnDirectKeys(BoundExpr e, java.util.Set<Integer> keyColIndexes) {
         return switch (e) {
             case BoundLiteral l -> true;

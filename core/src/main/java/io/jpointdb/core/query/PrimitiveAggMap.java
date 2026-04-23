@@ -59,8 +59,8 @@ final class PrimitiveAggMap {
     private boolean hasNull;
 
     PrimitiveAggMap(int width, int capacityHint, AggOp[] ops, int longFieldCount, int doubleFieldCount) {
-        if (width < 1 || width > 3) {
-            throw new IllegalArgumentException("width must be 1, 2, or 3");
+        if (width < 1 || width > 8) {
+            throw new IllegalArgumentException("width must be 1..8");
         }
         this.width = width;
         this.ops = ops;
@@ -209,6 +209,49 @@ final class PrimitiveAggMap {
         return slot;
     }
 
+    // ---------- generic width ≥ 4 ----------
+
+    /**
+     * Multi-column path for width ≥ 4. Uses a caller-provided scratch
+     * {@code long[width]} so the inner scan doesn't allocate per row.
+     * Specialized 1/2/3 paths above exist because they skip the bounds-
+     * checked loop; for width ≥ 4 the loop cost is tiny compared to the
+     * avoidable boxing in the generic {@code HashMap<List<Object>>} path.
+     */
+    int getOrCreateSlotN(long[] keyVec) {
+        int slot = probeN(keyVec);
+        if (!occupied[slot]) {
+            int base = slot * width;
+            for (int i = 0; i < width; i++) {
+                keys[base + i] = keyVec[i];
+            }
+            occupied[slot] = true;
+            recordSlot(slot);
+            size++;
+            if (size >= (int) (capacity * LOAD)) {
+                rehash();
+                slot = probeN(keyVec);
+            }
+        }
+        return slot;
+    }
+
+    private int probeN(long[] keyVec) {
+        int slot = (int) (mixN(keyVec) & mask);
+        outer:
+        while (occupied[slot]) {
+            int base = slot * width;
+            for (int i = 0; i < width; i++) {
+                if (keys[base + i] != keyVec[i]) {
+                    slot = (slot + 1) & mask;
+                    continue outer;
+                }
+            }
+            break;
+        }
+        return slot;
+    }
+
     // ---------- null group ----------
 
     int getOrCreateNullSlot() {
@@ -276,7 +319,7 @@ final class PrimitiveAggMap {
                 }
                 foldSlot(slot, other, oslot);
             }
-        } else { // width == 3
+        } else if (width == 3) {
             for (int i = 0; i < n; i++) {
                 int oslot = otherSlots[i];
                 long a = other.keys[oslot * 3];
@@ -295,6 +338,17 @@ final class PrimitiveAggMap {
                         slot = probe3(a, b, c);
                     }
                 }
+                foldSlot(slot, other, oslot);
+            }
+        } else {
+            long[] scratch = new long[width];
+            for (int i = 0; i < n; i++) {
+                int oslot = otherSlots[i];
+                int obase = oslot * width;
+                for (int k = 0; k < width; k++) {
+                    scratch[k] = other.keys[obase + k];
+                }
+                int slot = getOrCreateSlotN(scratch);
                 foldSlot(slot, other, oslot);
             }
         }
@@ -387,7 +441,7 @@ final class PrimitiveAggMap {
                 }
                 oldSlots[i] = slot;
             }
-        } else { // width == 3
+        } else if (width == 3) {
             for (int i = 0; i < oldSize; i++) {
                 int srcSlot = oldSlots[i];
                 long a = oldKeys[srcSlot * 3];
@@ -400,6 +454,31 @@ final class PrimitiveAggMap {
                 keys[slot * 3] = a;
                 keys[slot * 3 + 1] = b;
                 keys[slot * 3 + 2] = c;
+                occupied[slot] = true;
+                for (int f = 0; f < longFieldCount; f++) {
+                    longFields[f][slot] = oldLong[f][srcSlot];
+                }
+                for (int f = 0; f < doubleFieldCount; f++) {
+                    doubleFields[f][slot] = oldDouble[f][srcSlot];
+                }
+                oldSlots[i] = slot;
+            }
+        } else {
+            long[] scratch = new long[width];
+            for (int i = 0; i < oldSize; i++) {
+                int srcSlot = oldSlots[i];
+                int srcBase = srcSlot * width;
+                for (int k = 0; k < width; k++) {
+                    scratch[k] = oldKeys[srcBase + k];
+                }
+                int slot = (int) (mixN(scratch) & mask);
+                while (occupied[slot]) {
+                    slot = (slot + 1) & mask;
+                }
+                int dstBase = slot * width;
+                for (int k = 0; k < width; k++) {
+                    keys[dstBase + k] = scratch[k];
+                }
                 occupied[slot] = true;
                 for (int f = 0; f < longFieldCount; f++) {
                     longFields[f][slot] = oldLong[f][srcSlot];
@@ -436,6 +515,14 @@ final class PrimitiveAggMap {
         return mix(h);
     }
 
+    private static long mixN(long[] keyVec) {
+        long h = keyVec[0];
+        for (int i = 1; i < keyVec.length; i++) {
+            h = h * 0x9E3779B97F4A7C15L + keyVec[i];
+        }
+        return mix(h);
+    }
+
     /**
      * Hash a key the same way this map does internally — exposed so radix
      * partitioning can bucketize source entries using the identical distribution.
@@ -450,5 +537,9 @@ final class PrimitiveAggMap {
 
     static long hashKey(long a, long b, long c) {
         return mix3(a, b, c);
+    }
+
+    static long hashKeyN(long[] keyVec) {
+        return mixN(keyVec);
     }
 }
