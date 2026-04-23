@@ -2546,6 +2546,29 @@ public final class Executor {
                 continue;
             }
             BoundExpr arg = a.arg();
+            // AVG/SUM of STRLEN over a DICT STRING column — precompute a
+            // long[dictSize] of lengths once (cached across queries) and feed
+            // the inline agg via acceptLong without ever materializing the
+            // String.
+            if (arg instanceof BoundScalarCall sc
+                    && ("strlen".equals(sc.name()) || "length".equals(sc.name()))
+                    && sc.args().size() == 1
+                    && sc.args().get(0) instanceof BoundColumn strCol
+                    && table.columnMeta(strCol.index()).type() == ColumnType.STRING) {
+                io.jpointdb.core.column.StringColumn c = table.string(strCol.index());
+                if (c.mode() != io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                    return null;
+                }
+                long[] lengths = strLenMapFor(c);
+                if (lengths == null) {
+                    return null;
+                }
+                out[i] = (state, row) -> {
+                    boolean n = c.isNullAt(row);
+                    state.acceptLong(n ? 0L : lengths[c.idAt(row)], n);
+                };
+                continue;
+            }
             if (!(arg instanceof BoundColumn bc)) {
                 return null;
             }
@@ -2578,6 +2601,29 @@ public final class Executor {
             }
         }
         return out;
+    }
+
+    /**
+     * Cache of {@code dict -> long[size]} codepoint-count arrays so repeated
+     * AVG(STRLEN(URL))-style queries don't re-walk the dictionary.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<io.jpointdb.core.column.Dictionary, long[]> STRLEN_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static long @Nullable [] strLenMapFor(io.jpointdb.core.column.StringColumn c) {
+        io.jpointdb.core.column.Dictionary d = c.dictionary();
+        if (d == null) {
+            return null;
+        }
+        return STRLEN_CACHE.computeIfAbsent(d, dict -> {
+            int n = dict.size();
+            long[] out = new long[n];
+            for (int i = 0; i < n; i++) {
+                String s = dict.stringAt(i);
+                out[i] = s.codePointCount(0, s.length());
+            }
+            return out;
+        });
     }
 
     private static LongKeysAggMap scanAggChunkPrimitive(BoundSelect plan, Table table, List<BoundAgg> aggs,
