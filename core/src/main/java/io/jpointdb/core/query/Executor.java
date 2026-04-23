@@ -297,9 +297,10 @@ public final class Executor {
                     return executeAggregatedInline(plan, table, groupExprs, aggs, n, shape, simple, orderShape);
                 }
             }
-            // LongKeysAggMap only supports widths 1/2; width-3 falls through to the
-            // generic boxed-key path when the inline fast path can't take it.
-            if (shape.width() <= 2) {
+            // LongKeysAggMap only supports widths 1/2 and has no notion of
+            // derived groupExprs; either of those falls through to the generic
+            // boxed-key path when the inline fast path can't take it.
+            if (shape.width() <= 2 && shape.derivedExprs() == null) {
                 return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
             }
         }
@@ -818,7 +819,7 @@ public final class Executor {
      */
     @SuppressWarnings("ArrayRecordComponent")
     private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds, int[] exprToKey, @Nullable Object[] literalValues,
-            long @Nullable [][] dictMaps) {
+            long @Nullable [][] dictMaps, BoundExpr @Nullable [] derivedExprs) {
         int width() {
             return colIdx.length;
         }
@@ -1375,20 +1376,114 @@ public final class Executor {
         // one- and two-col GROUP BY shapes without paying for the general loop).
         if (n == 1) {
             int keyIdx = shape.exprToKey()[0];
-            Object v = keyIdx < 0 ? shape.literalValues()[0]
-                                  : boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx],
-                                          shape.kinds()[keyIdx]);
+            Object v = resolveKeyValue(shape, table, map, slot, 0, keyIdx);
             return java.util.Collections.singletonList(v);
         }
         @Nullable
         Object[] values = new @Nullable Object[n];
         for (int i = 0; i < n; i++) {
-            int keyIdx = shape.exprToKey()[i];
-            values[i] = keyIdx < 0 ? shape.literalValues()[i]
-                                   : boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx],
-                                           shape.kinds()[keyIdx]);
+            values[i] = resolveKeyValue(shape, table, map, slot, i, shape.exprToKey()[i]);
         }
         return Arrays.asList(values);
+    }
+
+    private static @Nullable Object resolveKeyValue(PrimitiveKeyShape shape, Table table, PrimitiveAggMap map, int slot,
+            int exprIdx, int keyIdx) {
+        if (keyIdx == -1) {
+            return shape.literalValues()[exprIdx];
+        }
+        if (keyIdx == -2) {
+            BoundExpr[] derived = shape.derivedExprs();
+            if (derived == null) {
+                throw new IllegalStateException("derived expr marker without derivedExprs");
+            }
+            BoundExpr d = derived[exprIdx];
+            return evalFromKeys(d, shape, table, map, slot);
+        }
+        return boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx], shape.kinds()[keyIdx]);
+    }
+
+    /**
+     * Evaluate a derived group expression against the primitive hash key slot.
+     * BoundColumn refs resolve to the stored raw key (boxed via {@link #boxKey});
+     * every other node recurses structurally. Mirrors
+     * {@link ExprEvaluator#evalScalarCall}'s fn shape so we don't depend on row
+     * reads — a derived expr by construction doesn't need them.
+     */
+    private static @Nullable Object evalFromKeys(BoundExpr e, PrimitiveKeyShape shape, Table table, PrimitiveAggMap map,
+            int slot) {
+        return switch (e) {
+            case BoundLiteral l -> l.value();
+            case BoundColumn c -> {
+                int ki = findDirectKeyIdx(shape, c.index());
+                if (ki < 0) {
+                    throw new IllegalStateException("derived BoundColumn " + c.name() + " not in key");
+                }
+                yield boxKey(table, map.keyAt(slot, ki), false, shape.colIdx()[ki], shape.kinds()[ki]);
+            }
+            case BoundUnary u -> applyUnary(u, evalFromKeys(u.operand(), shape, table, map, slot));
+            case BoundBinary b -> applyBinary(b, evalFromKeys(b.left(), shape, table, map, slot),
+                    evalFromKeys(b.right(), shape, table, map, slot));
+            case BoundIsNull n -> {
+                Object v = evalFromKeys(n.operand(), shape, table, map, slot);
+                yield n.negated() ? v != null : v == null;
+            }
+            case BoundCase c -> {
+                Object result = null;
+                for (BoundWhen w : c.whens()) {
+                    Object cond = evalFromKeys(w.when(), shape, table, map, slot);
+                    if (Boolean.TRUE.equals(cond)) {
+                        result = evalFromKeys(w.then(), shape, table, map, slot);
+                        break;
+                    }
+                }
+                if (result == null && c.elseExpr() != null) {
+                    result = evalFromKeys(c.elseExpr(), shape, table, map, slot);
+                }
+                yield result;
+            }
+            case BoundScalarCall sc ->
+                ExprEvaluator.evalScalarCall(sc, a -> evalFromKeys(a, shape, table, map, slot));
+            case BoundLike l -> {
+                Object v = evalFromKeys(l.value(), shape, table, map, slot);
+                Object p = evalFromKeys(l.pattern(), shape, table, map, slot);
+                if (v == null || p == null) {
+                    yield null;
+                }
+                boolean match = io.jpointdb.core.sql.LikeMatcher.forPattern((String) p).matches((String) v);
+                yield l.negated() ? !match : match;
+            }
+            case BoundInList il -> {
+                Object v = evalFromKeys(il.value(), shape, table, map, slot);
+                if (v == null) {
+                    yield null;
+                }
+                boolean found = false;
+                for (BoundExpr item : il.items()) {
+                    Object iv = evalFromKeys(item, shape, table, map, slot);
+                    if (iv != null && ExprEvaluator.compare(v, iv) == 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                yield il.negated() != found;
+            }
+            case BoundAgg a -> throw new AssertionError("aggregate in derived group expr");
+            case BoundDictBitsetMatch m -> throw new AssertionError("dict-bitset in derived group expr");
+        };
+    }
+
+    private static int findDirectKeyIdx(PrimitiveKeyShape shape, int columnIdx) {
+        int[] cols = shape.colIdx();
+        KeyKind[] kinds = shape.kinds();
+        for (int i = 0; i < cols.length; i++) {
+            // Only direct-column key slots count — DICT_STRING_EXTRACT_LONG slots
+            // reuse the same column but hold a derived long, not the raw value.
+            if (cols[i] == columnIdx && kinds[i] != KeyKind.DICT_STRING_EXTRACT_LONG) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static Aggregator[] synthesizeStates(PrimitiveAggMap map, int slot, InlineAccept[] accepts) {
@@ -1699,19 +1794,45 @@ public final class Executor {
         int[] exprToKey = new int[g];
         @Nullable
         Object[] literalValues = new @Nullable Object[g];
-        // First pass: classify each group expr, count columns, reject anything else.
+        BoundExpr[] derivedExprs = null;
+        // Pass 1: classify + count hash-key columns. A groupExpr becomes a key
+        // column in three ways: direct BoundColumn on a primitive/DICT column,
+        // BoundLiteral (no key col — a constant partition), extract(...) over a
+        // DICT STRING column (its own precomputed long key), or a "derived"
+        // expression whose value is a pure function of BoundColumns that appear
+        // as direct BoundColumn groupExprs. Derived exprs don't add new key
+        // columns — their value is materialized from the stored raw keys.
         int colCount = 0;
+        // Map from BoundColumn.index() -> the key slot it occupies, if it was
+        // seen as a direct BoundColumn groupExpr (not inside a derived expr).
+        java.util.HashMap<Integer, Integer> directColToKey = new java.util.HashMap<>();
         for (int i = 0; i < g; i++) {
             BoundExpr e = groupExprs.get(i);
-            if (e instanceof BoundColumn) {
-                exprToKey[i] = colCount++;
+            if (e instanceof BoundColumn bc) {
+                Integer existing = directColToKey.get(bc.index());
+                if (existing != null) {
+                    // Duplicate column reference — reuse the same key slot.
+                    exprToKey[i] = existing;
+                } else {
+                    exprToKey[i] = colCount;
+                    directColToKey.put(bc.index(), colCount);
+                    colCount++;
+                }
             } else if (e instanceof BoundLiteral lit) {
                 exprToKey[i] = -1;
                 literalValues[i] = lit.value();
             } else if (extractOverDictString(e, table) >= 0) {
+                // Each extract call gets its own precomputed key slot even if
+                // the underlying STRING column is also grouped directly.
                 exprToKey[i] = colCount++;
             } else {
-                return null;
+                // Candidate derived expr — validate in pass 3 once we know the
+                // full set of direct-column key slots.
+                exprToKey[i] = -2;
+                if (derivedExprs == null) {
+                    derivedExprs = new BoundExpr[g];
+                }
+                derivedExprs[i] = e;
             }
         }
         if (colCount < 1 || colCount > 3) {
@@ -1723,6 +1844,10 @@ public final class Executor {
         for (int i = 0; i < g; i++) {
             int ki = exprToKey[i];
             if (ki < 0) {
+                continue;
+            }
+            if (cols[ki] != 0 || kinds[ki] != null) {
+                // Already filled by an earlier duplicate; skip.
                 continue;
             }
             BoundExpr e = groupExprs.get(i);
@@ -1758,7 +1883,70 @@ public final class Executor {
                 return null;
             }
         }
-        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues, dictMaps);
+        // Pass 3: validate derived exprs depend only on direct-column keys.
+        if (derivedExprs != null) {
+            for (int i = 0; i < g; i++) {
+                BoundExpr d = derivedExprs[i];
+                if (d == null) {
+                    continue;
+                }
+                if (!dependsOnlyOnDirectKeys(d, directColToKey.keySet())) {
+                    return null;
+                }
+            }
+        }
+        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues, dictMaps, derivedExprs);
+    }
+
+    /**
+     * A groupExpr is "derived" if every {@link BoundColumn} it transitively
+     * references is a direct column of the GROUP BY list — i.e., the expression
+     * is a pure function of the hash-key state, and we can recompute it at
+     * materialize time from stored raw keys. Rejects aggregates, subqueries,
+     * and anything whose column refs aren't all tracked.
+     */
+    private static boolean dependsOnlyOnDirectKeys(BoundExpr e, java.util.Set<Integer> keyColIndexes) {
+        return switch (e) {
+            case BoundLiteral l -> true;
+            case BoundColumn c -> keyColIndexes.contains(c.index());
+            case BoundUnary u -> dependsOnlyOnDirectKeys(u.operand(), keyColIndexes);
+            case BoundBinary b -> dependsOnlyOnDirectKeys(b.left(), keyColIndexes)
+                    && dependsOnlyOnDirectKeys(b.right(), keyColIndexes);
+            case BoundIsNull n -> dependsOnlyOnDirectKeys(n.operand(), keyColIndexes);
+            case BoundLike l -> dependsOnlyOnDirectKeys(l.value(), keyColIndexes)
+                    && dependsOnlyOnDirectKeys(l.pattern(), keyColIndexes);
+            case BoundInList il -> {
+                if (!dependsOnlyOnDirectKeys(il.value(), keyColIndexes)) {
+                    yield false;
+                }
+                for (BoundExpr item : il.items()) {
+                    if (!dependsOnlyOnDirectKeys(item, keyColIndexes)) {
+                        yield false;
+                    }
+                }
+                yield true;
+            }
+            case BoundCase c -> {
+                for (BoundWhen w : c.whens()) {
+                    if (!dependsOnlyOnDirectKeys(w.when(), keyColIndexes)
+                            || !dependsOnlyOnDirectKeys(w.then(), keyColIndexes)) {
+                        yield false;
+                    }
+                }
+                yield c.elseExpr() == null || dependsOnlyOnDirectKeys(c.elseExpr(), keyColIndexes);
+            }
+            case BoundScalarCall sc -> {
+                for (BoundExpr arg : sc.args()) {
+                    if (!dependsOnlyOnDirectKeys(arg, keyColIndexes)) {
+                        yield false;
+                    }
+                }
+                yield true;
+            }
+            // Aggregates and bitset-matches don't belong in GROUP BY; reject.
+            case BoundAgg a -> false;
+            case BoundDictBitsetMatch m -> false;
+        };
     }
 
     /**
