@@ -176,6 +176,7 @@ public final class Executor {
             int orderCount, int k, boolean[] desc) {
         ExprEvaluator ev = new ExprEvaluator(table);
         BoundExpr where = plan.where();
+        RowPredicate wherePred = where == null ? null : RowPredicate.compile(where, table);
         List<BoundSelectItem> items = plan.items();
         List<BoundOrderItem> orderBy = plan.orderBy();
         // Min-heap ordered so the current WORST candidate sits at the root:
@@ -195,7 +196,7 @@ public final class Executor {
         };
         java.util.PriorityQueue<ScalarTopKEntry> heap = new java.util.PriorityQueue<>(k, worstFirst);
         for (long r = from; r < to; r++) {
-            if (where != null && !truthy(ev.eval(where, r))) {
+            if (where != null && !passesWhere(wherePred, where, ev, r)) {
                 continue;
             }
             @Nullable
@@ -245,10 +246,11 @@ public final class Executor {
         List<@Nullable Object[]> values = new ArrayList<>();
         List<@Nullable Object[]> sortKeys = orderCount == 0 ? null : new ArrayList<>();
         BoundExpr where = plan.where();
+        RowPredicate wherePred = where == null ? null : RowPredicate.compile(where, table);
         List<BoundSelectItem> items = plan.items();
         List<BoundOrderItem> orderBy = plan.orderBy();
         for (long r = from; r < to; r++) {
-            if (where != null && !truthy(ev.eval(where, r)))
+            if (where != null && !passesWhere(wherePred, where, ev, r))
                 continue;
             @Nullable
             Object[] v = new @Nullable Object[items.size()];
@@ -353,8 +355,9 @@ public final class Executor {
         List<List<Object>> order = new ArrayList<>();
         List<Object> scalarKey = List.of();
         BoundExpr where = plan.where();
+        RowPredicate wherePred = where == null ? null : RowPredicate.compile(where, table);
         for (long r = from; r < to; r++) {
-            if (where != null && !truthy(ev.eval(where, r)))
+            if (where != null && !passesWhere(wherePred, where, ev, r))
                 continue;
             List<Object> key;
             if (groupExprs.isEmpty()) {
@@ -1740,6 +1743,9 @@ public final class Executor {
                 aggShape.doubleFields());
         BoundExpr where = plan.where();
         InlineAccept[] accepts = aggShape.accepts();
+        // Compile a primitive WHERE predicate once per chunk. When it's
+        // non-null the scan checks it inline without boxing Boolean results.
+        RowPredicate wherePred = where == null ? null : RowPredicate.compile(where, table);
 
         LongKeyReader reader0 = keyReader(table, keyShape, 0);
         long[][] lf = map.longFields;
@@ -1747,7 +1753,7 @@ public final class Executor {
         int cap = map.capacity();
         if (keyShape.width() == 1) {
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 int slot;
@@ -1768,7 +1774,7 @@ public final class Executor {
         } else if (keyShape.width() == 2) {
             LongKeyReader reader1 = keyReader(table, keyShape, 1);
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 int slot;
@@ -1790,7 +1796,7 @@ public final class Executor {
             LongKeyReader reader1 = keyReader(table, keyShape, 1);
             LongKeyReader reader2 = keyReader(table, keyShape, 2);
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 int slot;
@@ -1817,7 +1823,7 @@ public final class Executor {
             }
             long[] scratch = new long[w];
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 int slot;
@@ -2516,6 +2522,7 @@ public final class Executor {
         int chunkHint = (int) Math.min((long) Integer.MAX_VALUE, Math.max(64L, to - from));
         LongKeysAggMap map = new LongKeysAggMap(shape.width(), chunkHint);
         BoundExpr where = plan.where();
+        RowPredicate wherePred = where == null ? null : RowPredicate.compile(where, table);
         LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
 
         LongKeyReader reader0 = keyReader(table, shape, 0);
@@ -2523,7 +2530,7 @@ public final class Executor {
 
         if (shape.width() == 1) {
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 Aggregator[] states;
@@ -2537,7 +2544,7 @@ public final class Executor {
         } else {
             LongKeyReader reader1 = keyReader(table, shape, 1);
             for (long r = from; r < to; r++) {
-                if (where != null && !truthy(ev.eval(where, r))) {
+                if (where != null && !passesWhere(wherePred, where, ev, r)) {
                     continue;
                 }
                 boolean null0 = reader0.isNullAt(r);
@@ -3022,6 +3029,129 @@ public final class Executor {
 
     private static boolean truthy(@Nullable Object v) {
         return Boolean.TRUE.equals(v);
+    }
+
+    /**
+     * Primitive per-row WHERE predicate. {@code null} means "I couldn't compile
+     * this WHERE into a pure primitive chain"; the caller falls back to the
+     * boxed {@link ExprEvaluator#eval} path.
+     */
+    @FunctionalInterface
+    interface RowPredicate {
+        boolean test(long row);
+
+        /**
+         * Compile an AND-chain of primitive-evaluable leaves (non-nullable int
+         * comparisons and {@link BoundDictBitsetMatch}) into a single row
+         * predicate. Returns null if any sub-expression isn't trivially
+         * primitive — the caller then falls back to the boxed eval path.
+         */
+        static @Nullable RowPredicate compile(BoundExpr e, Table table) {
+            return switch (e) {
+                case BoundBinary b -> {
+                    if (b.op() == SqlAst.BinaryOp.AND) {
+                        RowPredicate l = compile(b.left(), table);
+                        if (l == null) {
+                            yield null;
+                        }
+                        RowPredicate r = compile(b.right(), table);
+                        if (r == null) {
+                            yield null;
+                        }
+                        final RowPredicate fl = l;
+                        final RowPredicate fr = r;
+                        yield row -> fl.test(row) && fr.test(row);
+                    }
+                    yield compileComparison(b, table);
+                }
+                case BoundDictBitsetMatch m -> compileBitsetMatch(m, table);
+                default -> null;
+            };
+        }
+
+        private static @Nullable RowPredicate compileBitsetMatch(BoundDictBitsetMatch m, Table table) {
+            io.jpointdb.core.column.StringColumn col = table.string(m.columnIndex());
+            if (col.nullable()) {
+                // Nullable: NULL participates in 3-valued logic. Fall back.
+                return null;
+            }
+            boolean[] bitset = m.bitset();
+            boolean negated = m.negated();
+            if (negated) {
+                return row -> !bitset[col.idAt(row)];
+            }
+            return row -> bitset[col.idAt(row)];
+        }
+
+        private static @Nullable RowPredicate compileComparison(BoundBinary b, Table table) {
+            BoundColumn col;
+            BoundLiteral lit;
+            SqlAst.BinaryOp op = b.op();
+            if (b.left() instanceof BoundColumn c && b.right() instanceof BoundLiteral l) {
+                col = c;
+                lit = l;
+            } else if (b.left() instanceof BoundLiteral l && b.right() instanceof BoundColumn c) {
+                col = c;
+                lit = l;
+                op = switch (op) {
+                    case EQ -> SqlAst.BinaryOp.EQ;
+                    case NEQ -> SqlAst.BinaryOp.NEQ;
+                    case LT -> SqlAst.BinaryOp.GT;
+                    case LE -> SqlAst.BinaryOp.GE;
+                    case GT -> SqlAst.BinaryOp.LT;
+                    case GE -> SqlAst.BinaryOp.LE;
+                    default -> null;
+                };
+                if (op == null) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+            ColumnType ct = table.columnMeta(col.index()).type();
+            if (!(lit.value() instanceof Long litVal)) {
+                return null;
+            }
+            if (ct == ColumnType.I32) {
+                I32Column c = table.i32(col.index());
+                if (c.nullable()) {
+                    return null;
+                }
+                int lv = litVal.intValue();
+                return switch (op) {
+                    case EQ -> row -> c.get(row) == lv;
+                    case NEQ -> row -> c.get(row) != lv;
+                    case LT -> row -> c.get(row) < lv;
+                    case LE -> row -> c.get(row) <= lv;
+                    case GT -> row -> c.get(row) > lv;
+                    case GE -> row -> c.get(row) >= lv;
+                    default -> null;
+                };
+            } else if (ct == ColumnType.I64) {
+                I64Column c = table.i64(col.index());
+                if (c.nullable()) {
+                    return null;
+                }
+                long lv = litVal;
+                return switch (op) {
+                    case EQ -> row -> c.get(row) == lv;
+                    case NEQ -> row -> c.get(row) != lv;
+                    case LT -> row -> c.get(row) < lv;
+                    case LE -> row -> c.get(row) <= lv;
+                    case GT -> row -> c.get(row) > lv;
+                    case GE -> row -> c.get(row) >= lv;
+                    default -> null;
+                };
+            }
+            return null;
+        }
+    }
+
+    private static boolean passesWhere(@Nullable RowPredicate pred, BoundExpr where, ExprEvaluator ev, long row) {
+        if (pred != null) {
+            return pred.test(row);
+        }
+        return truthy(ev.eval(where, row));
     }
 
     private static List<@Nullable Object[]> applyLimit(List<@Nullable Object[]> rows, long offset, long limit) {
