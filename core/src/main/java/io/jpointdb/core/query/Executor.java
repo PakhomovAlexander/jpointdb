@@ -297,7 +297,11 @@ public final class Executor {
                     return executeAggregatedInline(plan, table, groupExprs, aggs, n, shape, simple, orderShape);
                 }
             }
-            return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
+            // LongKeysAggMap only supports widths 1/2; width-3 falls through to the
+            // generic boxed-key path when the inline fast path can't take it.
+            if (shape.width() <= 2) {
+                return executeAggregatedPrimitive(plan, table, groupExprs, aggs, n, shape);
+            }
         }
 
         AggChunk merged;
@@ -785,7 +789,13 @@ public final class Executor {
     }
 
     private enum KeyKind {
-        I32, I64, DICT_STRING
+        I32, I64, DICT_STRING,
+        /**
+         * {@code extract(<field> FROM <DICT-encoded STRING column>)} — a scalar call
+         * whose dict-id-to-long mapping is precomputed once per query, so the hot
+         * scan reduces to {@code map[col.idAt(row)]} — a pure array load.
+         */
+        DICT_STRING_EXTRACT_LONG
     }
 
     /**
@@ -807,7 +817,8 @@ public final class Executor {
      * {@code exprToKey = [-1, 0]} and {@code literalValues = [1L, null]}.
      */
     @SuppressWarnings("ArrayRecordComponent")
-    private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds, int[] exprToKey, @Nullable Object[] literalValues) {
+    private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds, int[] exprToKey, @Nullable Object[] literalValues,
+            long @Nullable [][] dictMaps) {
         int width() {
             return colIdx.length;
         }
@@ -1132,7 +1143,7 @@ public final class Executor {
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
                     }
-                } else {
+                } else if (width == 2) {
                     for (PrimitiveAggMap chunk : chunks) {
                         int[] slots = chunk.occupiedSlots();
                         int nn = chunk.nonNullSize();
@@ -1144,6 +1155,22 @@ public final class Executor {
                                 continue;
                             }
                             int dstSlot = out.getOrCreateSlot2(a, b);
+                            out.foldSlotFrom(dstSlot, chunk, srcSlot);
+                        }
+                    }
+                } else { // width == 3
+                    for (PrimitiveAggMap chunk : chunks) {
+                        int[] slots = chunk.occupiedSlots();
+                        int nn = chunk.nonNullSize();
+                        for (int j = 0; j < nn; j++) {
+                            int srcSlot = slots[j];
+                            long a = chunk.keyAt(srcSlot, 0);
+                            long b = chunk.keyAt(srcSlot, 1);
+                            long c = chunk.keyAt(srcSlot, 2);
+                            if ((int) (PrimitiveAggMap.hashKey(a, b, c) & pMask) != part) {
+                                continue;
+                            }
+                            int dstSlot = out.getOrCreateSlot3(a, b, c);
                             out.foldSlotFrom(dstSlot, chunk, srcSlot);
                         }
                     }
@@ -1593,7 +1620,7 @@ public final class Executor {
         BoundExpr where = plan.where();
         InlineAccept[] accepts = aggShape.accepts();
 
-        LongKeyReader reader0 = keyReader(table, keyShape.colIdx()[0], keyShape.kinds()[0]);
+        LongKeyReader reader0 = keyReader(table, keyShape, 0);
         long[][] lf = map.longFields;
         double[][] df = map.doubleFields;
         int cap = map.capacity();
@@ -1617,8 +1644,8 @@ public final class Executor {
                     accepts[i].acceptRow(lf, df, slot, r);
                 }
             }
-        } else {
-            LongKeyReader reader1 = keyReader(table, keyShape.colIdx()[1], keyShape.kinds()[1]);
+        } else if (keyShape.width() == 2) {
+            LongKeyReader reader1 = keyReader(table, keyShape, 1);
             for (long r = from; r < to; r++) {
                 if (where != null && !truthy(ev.eval(where, r))) {
                     continue;
@@ -1628,6 +1655,28 @@ public final class Executor {
                     slot = map.getOrCreateNullSlot();
                 } else {
                     slot = map.getOrCreateSlot2(reader0.keyAt(r), reader1.keyAt(r));
+                }
+                if (map.capacity() != cap) {
+                    lf = map.longFields;
+                    df = map.doubleFields;
+                    cap = map.capacity();
+                }
+                for (int i = 0; i < accepts.length; i++) {
+                    accepts[i].acceptRow(lf, df, slot, r);
+                }
+            }
+        } else { // width == 3
+            LongKeyReader reader1 = keyReader(table, keyShape, 1);
+            LongKeyReader reader2 = keyReader(table, keyShape, 2);
+            for (long r = from; r < to; r++) {
+                if (where != null && !truthy(ev.eval(where, r))) {
+                    continue;
+                }
+                int slot;
+                if (reader0.isNullAt(r) || reader1.isNullAt(r) || reader2.isNullAt(r)) {
+                    slot = map.getOrCreateNullSlot();
+                } else {
+                    slot = map.getOrCreateSlot3(reader0.keyAt(r), reader1.keyAt(r), reader2.keyAt(r));
                 }
                 if (map.capacity() != cap) {
                     lf = map.longFields;
@@ -1659,35 +1708,104 @@ public final class Executor {
             } else if (e instanceof BoundLiteral lit) {
                 exprToKey[i] = -1;
                 literalValues[i] = lit.value();
+            } else if (extractOverDictString(e, table) >= 0) {
+                exprToKey[i] = colCount++;
             } else {
                 return null;
             }
         }
-        if (colCount < 1 || colCount > 2) {
+        if (colCount < 1 || colCount > 3) {
             return null;
         }
         int[] cols = new int[colCount];
         KeyKind[] kinds = new KeyKind[colCount];
+        long[][] dictMaps = null;
         for (int i = 0; i < g; i++) {
             int ki = exprToKey[i];
             if (ki < 0) {
                 continue;
             }
-            BoundColumn bc = (BoundColumn) groupExprs.get(i);
-            ColumnType t = table.columnMeta(bc.index()).type();
-            if (t == ColumnType.I32) {
-                kinds[ki] = KeyKind.I32;
-            } else if (t == ColumnType.I64) {
-                kinds[ki] = KeyKind.I64;
-            } else if (t == ColumnType.STRING
-                    && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
-                kinds[ki] = KeyKind.DICT_STRING;
+            BoundExpr e = groupExprs.get(i);
+            if (e instanceof BoundColumn bc) {
+                ColumnType t = table.columnMeta(bc.index()).type();
+                if (t == ColumnType.I32) {
+                    kinds[ki] = KeyKind.I32;
+                } else if (t == ColumnType.I64) {
+                    kinds[ki] = KeyKind.I64;
+                } else if (t == ColumnType.STRING
+                        && table.string(bc.index()).mode() == io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+                    kinds[ki] = KeyKind.DICT_STRING;
+                } else {
+                    return null;
+                }
+                cols[ki] = bc.index();
+            } else if (e instanceof BoundScalarCall sc) {
+                int colIdx = extractOverDictString(sc, table);
+                if (colIdx < 0) {
+                    return null;
+                }
+                long[] map = buildExtractMap(sc, table.string(colIdx).dictionary());
+                if (map == null) {
+                    return null;
+                }
+                if (dictMaps == null) {
+                    dictMaps = new long[colCount][];
+                }
+                dictMaps[ki] = map;
+                kinds[ki] = KeyKind.DICT_STRING_EXTRACT_LONG;
+                cols[ki] = colIdx;
             } else {
                 return null;
             }
-            cols[ki] = bc.index();
         }
-        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues);
+        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues, dictMaps);
+    }
+
+    /**
+     * Returns the DICT-encoded STRING column index if {@code e} is a scalar
+     * extract/date_trunc-like call whose single arg is such a column; else -1.
+     * Current fast path supports {@code extract:<field>} only.
+     */
+    private static int extractOverDictString(BoundExpr e, Table table) {
+        if (!(e instanceof BoundScalarCall sc) || !sc.name().startsWith("extract:")) {
+            return -1;
+        }
+        if (sc.args().size() != 1 || !(sc.args().get(0) instanceof BoundColumn bc)) {
+            return -1;
+        }
+        if (table.columnMeta(bc.index()).type() != ColumnType.STRING) {
+            return -1;
+        }
+        io.jpointdb.core.column.StringColumn col = table.string(bc.index());
+        if (col.mode() != io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+            return -1;
+        }
+        if (col.dictionary() == null) {
+            return -1;
+        }
+        return bc.index();
+    }
+
+    /**
+     * Precomputes a {@code dictId → extracted-long} table so the scan reduces to a
+     * single array load per row. Any dict entry that {@link ScalarFns#extract}
+     * rejects (malformed timestamp) returns {@link Long#MIN_VALUE} in the map —
+     * row-level nulling is caught by the null-group path via the source column's
+     * null mask, and this sentinel only shows up when the dict holds a bad string.
+     */
+    private static long @Nullable [] buildExtractMap(BoundScalarCall sc,
+            io.jpointdb.core.column.@Nullable Dictionary d) {
+        if (d == null) {
+            return null;
+        }
+        String field = sc.name().substring("extract:".length());
+        int n = d.size();
+        long[] map = new long[n];
+        for (int i = 0; i < n; i++) {
+            Long v = ScalarFns.extract(field, d.stringAt(i));
+            map[i] = v == null ? Long.MIN_VALUE : v;
+        }
+        return map;
     }
 
     private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
@@ -1780,7 +1898,9 @@ public final class Executor {
         long keyAt(long row);
     }
 
-    private static LongKeyReader keyReader(Table table, int colIdx, KeyKind kind) {
+    private static LongKeyReader keyReader(Table table, PrimitiveKeyShape shape, int keyIdx) {
+        int colIdx = shape.colIdx()[keyIdx];
+        KeyKind kind = shape.kinds()[keyIdx];
         return switch (kind) {
             case I32 -> {
                 I32Column c = table.i32(colIdx);
@@ -1821,6 +1941,25 @@ public final class Executor {
                     @Override
                     public long keyAt(long row) {
                         return c.idAt(row);
+                    }
+                };
+            }
+            case DICT_STRING_EXTRACT_LONG -> {
+                io.jpointdb.core.column.StringColumn c = table.string(colIdx);
+                long[][] maps = shape.dictMaps();
+                if (maps == null || maps[keyIdx] == null) {
+                    throw new IllegalStateException("DICT_STRING_EXTRACT_LONG requires a dict map at key " + keyIdx);
+                }
+                long[] dictMap = maps[keyIdx];
+                yield new LongKeyReader() {
+                    @Override
+                    public boolean isNullAt(long row) {
+                        return c.isNullAt(row);
+                    }
+
+                    @Override
+                    public long keyAt(long row) {
+                        return dictMap[c.idAt(row)];
                     }
                 };
             }
@@ -1896,7 +2035,7 @@ public final class Executor {
         BoundExpr where = plan.where();
         LongKeysAggMap.AggFactory factory = () -> createStates(aggs);
 
-        LongKeyReader reader0 = keyReader(table, shape.colIdx()[0], shape.kinds()[0]);
+        LongKeyReader reader0 = keyReader(table, shape, 0);
         PrimAggAccept[] primAccepts = resolvePrimitiveArgAccepts(aggs, table);
 
         if (shape.width() == 1) {
@@ -1913,7 +2052,7 @@ public final class Executor {
                 acceptAggRow(states, aggs, ev, r, primAccepts);
             }
         } else {
-            LongKeyReader reader1 = keyReader(table, shape.colIdx()[1], shape.kinds()[1]);
+            LongKeyReader reader1 = keyReader(table, shape, 1);
             for (long r = from; r < to; r++) {
                 if (where != null && !truthy(ev.eval(where, r))) {
                     continue;
@@ -1983,6 +2122,7 @@ public final class Executor {
                 }
                 yield d.stringAt((int) k);
             }
+            case DICT_STRING_EXTRACT_LONG -> k;
         };
     }
 
@@ -2399,6 +2539,7 @@ public final class Executor {
         return new ArrayList<>(rows.subList(from, to));
     }
 
+    @SuppressWarnings("NullAway")
     private static QueryResult toResult(BoundSelect plan, List<@Nullable Object[]> rows) {
         List<String> names = new ArrayList<>(plan.items().size());
         List<ValueType> types = new ArrayList<>(plan.items().size());

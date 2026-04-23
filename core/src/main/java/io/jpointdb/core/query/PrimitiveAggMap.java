@@ -59,8 +59,8 @@ final class PrimitiveAggMap {
     private boolean hasNull;
 
     PrimitiveAggMap(int width, int capacityHint, AggOp[] ops, int longFieldCount, int doubleFieldCount) {
-        if (width != 1 && width != 2) {
-            throw new IllegalArgumentException("width must be 1 or 2");
+        if (width < 1 || width > 3) {
+            throw new IllegalArgumentException("width must be 1, 2, or 3");
         }
         this.width = width;
         this.ops = ops;
@@ -181,6 +181,34 @@ final class PrimitiveAggMap {
         return slot;
     }
 
+    // ---------- width=3 ----------
+
+    int getOrCreateSlot3(long a, long b, long c) {
+        int slot = probe3(a, b, c);
+        if (!occupied[slot]) {
+            keys[slot * 3] = a;
+            keys[slot * 3 + 1] = b;
+            keys[slot * 3 + 2] = c;
+            occupied[slot] = true;
+            recordSlot(slot);
+            size++;
+            if (size >= (int) (capacity * LOAD)) {
+                rehash();
+                slot = probe3(a, b, c);
+            }
+        }
+        return slot;
+    }
+
+    private int probe3(long a, long b, long c) {
+        int slot = (int) (mix3(a, b, c) & mask);
+        while (occupied[slot]
+                && (keys[slot * 3] != a || keys[slot * 3 + 1] != b || keys[slot * 3 + 2] != c)) {
+            slot = (slot + 1) & mask;
+        }
+        return slot;
+    }
+
     // ---------- null group ----------
 
     int getOrCreateNullSlot() {
@@ -229,7 +257,7 @@ final class PrimitiveAggMap {
                 }
                 foldSlot(slot, other, oslot);
             }
-        } else {
+        } else if (width == 2) {
             for (int i = 0; i < n; i++) {
                 int oslot = otherSlots[i];
                 long a = other.keys[oslot * 2];
@@ -244,6 +272,27 @@ final class PrimitiveAggMap {
                     if (size >= (int) (capacity * LOAD)) {
                         rehash();
                         slot = probe2(a, b);
+                    }
+                }
+                foldSlot(slot, other, oslot);
+            }
+        } else { // width == 3
+            for (int i = 0; i < n; i++) {
+                int oslot = otherSlots[i];
+                long a = other.keys[oslot * 3];
+                long b = other.keys[oslot * 3 + 1];
+                long c = other.keys[oslot * 3 + 2];
+                int slot = probe3(a, b, c);
+                if (!occupied[slot]) {
+                    keys[slot * 3] = a;
+                    keys[slot * 3 + 1] = b;
+                    keys[slot * 3 + 2] = c;
+                    occupied[slot] = true;
+                    recordSlot(slot);
+                    size++;
+                    if (size >= (int) (capacity * LOAD)) {
+                        rehash();
+                        slot = probe3(a, b, c);
                     }
                 }
                 foldSlot(slot, other, oslot);
@@ -318,7 +367,7 @@ final class PrimitiveAggMap {
                 }
                 oldSlots[i] = slot;
             }
-        } else {
+        } else if (width == 2) {
             for (int i = 0; i < oldSize; i++) {
                 int srcSlot = oldSlots[i];
                 long a = oldKeys[srcSlot * 2];
@@ -329,6 +378,28 @@ final class PrimitiveAggMap {
                 }
                 keys[slot * 2] = a;
                 keys[slot * 2 + 1] = b;
+                occupied[slot] = true;
+                for (int f = 0; f < longFieldCount; f++) {
+                    longFields[f][slot] = oldLong[f][srcSlot];
+                }
+                for (int f = 0; f < doubleFieldCount; f++) {
+                    doubleFields[f][slot] = oldDouble[f][srcSlot];
+                }
+                oldSlots[i] = slot;
+            }
+        } else { // width == 3
+            for (int i = 0; i < oldSize; i++) {
+                int srcSlot = oldSlots[i];
+                long a = oldKeys[srcSlot * 3];
+                long b = oldKeys[srcSlot * 3 + 1];
+                long c = oldKeys[srcSlot * 3 + 2];
+                int slot = (int) (mix3(a, b, c) & mask);
+                while (occupied[slot]) {
+                    slot = (slot + 1) & mask;
+                }
+                keys[slot * 3] = a;
+                keys[slot * 3 + 1] = b;
+                keys[slot * 3 + 2] = c;
                 occupied[slot] = true;
                 for (int f = 0; f < longFieldCount; f++) {
                     longFields[f][slot] = oldLong[f][srcSlot];
@@ -359,6 +430,12 @@ final class PrimitiveAggMap {
         return mix(h);
     }
 
+    private static long mix3(long a, long b, long c) {
+        long h = a * 0x9E3779B97F4A7C15L + b;
+        h = h * 0x9E3779B97F4A7C15L + c;
+        return mix(h);
+    }
+
     /**
      * Hash a key the same way this map does internally — exposed so radix
      * partitioning can bucketize source entries using the identical distribution.
@@ -369,5 +446,9 @@ final class PrimitiveAggMap {
 
     static long hashKey(long a, long b) {
         return mix2(a, b);
+    }
+
+    static long hashKey(long a, long b, long c) {
+        return mix3(a, b, c);
     }
 }
