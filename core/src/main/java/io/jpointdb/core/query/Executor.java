@@ -3111,25 +3111,50 @@ public final class Executor {
          * comparisons and {@link BoundDictBitsetMatch}) into a single row
          * predicate. Returns null if any sub-expression isn't trivially
          * primitive — the caller then falls back to the boxed eval path.
+         *
+         * <p>
+         * Flattens deeply nested {@code (a AND b AND c AND ...)} trees into a
+         * single {@code RowPredicate[]} and iterates it with a tight for-loop
+         * rather than producing nested two-arg lambdas: a 6-level lambda chain
+         * doesn't reliably inline, a loop over 6 predicates does.
          */
         static @Nullable RowPredicate compile(BoundExpr e, Table table) {
-            return switch (e) {
-                case BoundBinary b -> {
-                    if (b.op() == SqlAst.BinaryOp.AND) {
-                        RowPredicate l = compile(b.left(), table);
-                        if (l == null) {
-                            yield null;
-                        }
-                        RowPredicate r = compile(b.right(), table);
-                        if (r == null) {
-                            yield null;
-                        }
-                        final RowPredicate fl = l;
-                        final RowPredicate fr = r;
-                        yield row -> fl.test(row) && fr.test(row);
+            java.util.List<RowPredicate> leaves = new java.util.ArrayList<>();
+            if (!collectAndLeaves(e, table, leaves)) {
+                return null;
+            }
+            if (leaves.isEmpty()) {
+                return null;
+            }
+            if (leaves.size() == 1) {
+                return leaves.get(0);
+            }
+            RowPredicate[] arr = leaves.toArray(new RowPredicate[0]);
+            return row -> {
+                for (RowPredicate p : arr) {
+                    if (!p.test(row)) {
+                        return false;
                     }
-                    yield compileComparison(b, table);
                 }
+                return true;
+            };
+        }
+
+        private static boolean collectAndLeaves(BoundExpr e, Table table, java.util.List<RowPredicate> out) {
+            if (e instanceof BoundBinary b && b.op() == SqlAst.BinaryOp.AND) {
+                return collectAndLeaves(b.left(), table, out) && collectAndLeaves(b.right(), table, out);
+            }
+            RowPredicate leaf = compileLeaf(e, table);
+            if (leaf == null) {
+                return false;
+            }
+            out.add(leaf);
+            return true;
+        }
+
+        private static @Nullable RowPredicate compileLeaf(BoundExpr e, Table table) {
+            return switch (e) {
+                case BoundBinary b -> compileComparison(b, table);
                 case BoundDictBitsetMatch m -> compileBitsetMatch(m, table);
                 default -> null;
             };
