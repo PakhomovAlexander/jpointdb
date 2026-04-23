@@ -9,6 +9,7 @@ import io.jpointdb.core.sql.BoundAst.BoundColumn;
 import io.jpointdb.core.sql.BoundAst.BoundDictBitsetMatch;
 import io.jpointdb.core.sql.BoundAst.BoundExpr;
 import io.jpointdb.core.sql.BoundAst.BoundIsNull;
+import io.jpointdb.core.sql.BoundAst.BoundLike;
 import io.jpointdb.core.sql.BoundAst.BoundLiteral;
 import io.jpointdb.core.sql.BoundAst.BoundUnary;
 import io.jpointdb.core.sql.SqlAst.BinaryOp;
@@ -40,6 +41,20 @@ public final class DictBitsetRewriter {
      */
     private static final int MAX_DICT_SIZE = 2_000_000;
 
+    /**
+     * Bitsets are deterministic given (dict, literal/pattern) and {@link Dictionary}
+     * identity is stable for the lifetime of a column — cache across queries so
+     * repeated hits on the same filter don't re-walk a 275k-entry URL dict each
+     * time. Keyed by identity so dicts that happen to be equal-by-value don't
+     * collide.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<CacheKey, boolean[]> BITSET_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** {@code kind} disambiguates "EQ 'x'" from "LIKE 'x'" on the same dict. */
+    private record CacheKey(Dictionary dict, String kind, String literal) {
+    }
+
     private DictBitsetRewriter() {
     }
 
@@ -54,8 +69,50 @@ public final class DictBitsetRewriter {
                 BoundExpr inner = rewrite(n.operand(), table);
                 yield inner == n.operand() ? n : new BoundIsNull(inner, n.negated());
             }
+            case BoundLike l -> rewriteLike(l, table);
             default -> e;
         };
+    }
+
+    /**
+     * Precompute {@code col LIKE <literal pattern>} against a DICT STRING
+     * column. {@link LikeMatcher} is cached by pattern — running it once per
+     * dict entry at bind time replaces a per-row matcher call with a single
+     * {@code bitset[col.idAt(row)]} array load.
+     */
+    private static BoundExpr rewriteLike(BoundLike l, Table table) {
+        if (!(l.value() instanceof BoundColumn col)) {
+            return l;
+        }
+        if (!(l.pattern() instanceof BoundLiteral patLit) || !(patLit.value() instanceof String pattern)) {
+            return l;
+        }
+        ColumnType ct = table.columnMeta(col.index()).type();
+        if (ct != ColumnType.STRING) {
+            return l;
+        }
+        StringColumn sc = table.string(col.index());
+        if (sc.mode() != StringColumnWriter.Mode.DICT) {
+            return l;
+        }
+        Dictionary dict = sc.dictionary();
+        if (dict == null || dict.size() > MAX_DICT_SIZE) {
+            return l;
+        }
+        LikeMatcher matcher = l.matcher();
+        if (matcher == null) {
+            matcher = LikeMatcher.forPattern(pattern);
+        }
+        LikeMatcher finalMatcher = matcher;
+        boolean[] bitset = BITSET_CACHE.computeIfAbsent(new CacheKey(dict, "LIKE", pattern), k -> {
+            int n = dict.size();
+            boolean[] out = new boolean[n];
+            for (int i = 0; i < n; i++) {
+                out[i] = finalMatcher.matches(dict.stringAt(i));
+            }
+            return out;
+        });
+        return new BoundDictBitsetMatch(col.index(), col.name(), bitset, l.negated());
     }
 
     private static BoundExpr rewriteBinary(BoundBinary b, Table table) {
@@ -104,7 +161,9 @@ public final class DictBitsetRewriter {
         if (dict == null || dict.size() > MAX_DICT_SIZE) {
             return b;
         }
-        boolean[] bitset = buildBitset(dict, op, litValue);
+        BinaryOp finalOp = op;
+        boolean[] bitset = BITSET_CACHE.computeIfAbsent(new CacheKey(dict, finalOp.name(), litValue),
+                k -> buildBitset(dict, finalOp, litValue));
         if (bitset == null) {
             return b;
         }
