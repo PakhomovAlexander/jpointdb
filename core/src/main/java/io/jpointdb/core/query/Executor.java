@@ -1882,9 +1882,11 @@ public final class Executor {
             } else if (e instanceof BoundLiteral lit) {
                 exprToKey[i] = -1;
                 literalValues[i] = lit.value();
-            } else if (extractOverDictString(e, table) >= 0 || dateTruncOverDictString(e, table) >= 0) {
-                // Each extract / date_trunc call gets its own precomputed key slot
-                // even if the underlying STRING column is also grouped directly.
+            } else if (extractOverDictString(e, table) >= 0 || dateTruncOverDictString(e, table) >= 0
+                    || regexpReplaceOverDictString(e, table) >= 0) {
+                // Each extract / date_trunc / regexp_replace call gets its own
+                // precomputed key slot even if the underlying STRING column is
+                // also grouped directly.
                 exprToKey[i] = colCount++;
             } else {
                 // Candidate derived expr — validate in pass 3 once we know the
@@ -1962,15 +1964,22 @@ public final class Executor {
                     cols[ki] = extractCol;
                 } else {
                     int truncCol = dateTruncOverDictString(sc, table);
-                    if (truncCol < 0) {
-                        return null;
+                    int regexCol = -1;
+                    Object[] built;
+                    if (truncCol >= 0) {
+                        built = buildDateTruncMap(sc, table.string(truncCol).dictionary());
+                    } else {
+                        regexCol = regexpReplaceOverDictString(sc, table);
+                        if (regexCol < 0) {
+                            return null;
+                        }
+                        built = buildRegexReplaceMap(sc, table.string(regexCol).dictionary());
                     }
-                    Object[] built = buildDateTruncMap(sc, table.string(truncCol).dictionary());
                     if (built == null) {
                         return null;
                     }
                     long[] idMap = (long[]) built[0];
-                    String[] truncDict = (String[]) built[1];
+                    String[] newDict = (String[]) built[1];
                     if (dictMaps == null) {
                         dictMaps = new long[colCount][];
                     }
@@ -1978,9 +1987,9 @@ public final class Executor {
                     if (truncDicts == null) {
                         truncDicts = new String[colCount][];
                     }
-                    truncDicts[ki] = truncDict;
+                    truncDicts[ki] = newDict;
                     kinds[ki] = KeyKind.DICT_STRING_TRUNC_STRING;
-                    cols[ki] = truncCol;
+                    cols[ki] = truncCol >= 0 ? truncCol : regexCol;
                 }
             } else {
                 return null;
@@ -2128,6 +2137,40 @@ public final class Executor {
         return scalarCallOverDictString(e, "date_trunc:", table);
     }
 
+    /**
+     * {@code regexp_replace(<DICT STRING col>, <string lit pattern>, <string lit repl>)}
+     * — returns the column index if the pattern and replacement are constant
+     * so the per-dict-entry rewrite is deterministic; else -1.
+     */
+    private static int regexpReplaceOverDictString(BoundExpr e, Table table) {
+        if (!(e instanceof BoundScalarCall sc) || !"regexp_replace".equals(sc.name())) {
+            return -1;
+        }
+        if (sc.args().size() != 3) {
+            return -1;
+        }
+        if (!(sc.args().get(0) instanceof BoundColumn bc)) {
+            return -1;
+        }
+        if (!(sc.args().get(1) instanceof BoundLiteral patLit) || !(patLit.value() instanceof String)) {
+            return -1;
+        }
+        if (!(sc.args().get(2) instanceof BoundLiteral replLit) || !(replLit.value() instanceof String)) {
+            return -1;
+        }
+        if (table.columnMeta(bc.index()).type() != ColumnType.STRING) {
+            return -1;
+        }
+        io.jpointdb.core.column.StringColumn col = table.string(bc.index());
+        if (col.mode() != io.jpointdb.core.column.StringColumnWriter.Mode.DICT) {
+            return -1;
+        }
+        if (col.dictionary() == null) {
+            return -1;
+        }
+        return bc.index();
+    }
+
     private static int scalarCallOverDictString(BoundExpr e, String prefix, Table table) {
         if (!(e instanceof BoundScalarCall sc) || !sc.name().startsWith(prefix)) {
             return -1;
@@ -2186,25 +2229,67 @@ public final class Executor {
             return null;
         }
         String precision = sc.name().substring("date_trunc:".length());
-        int n = d.size();
-        // First pass: compute truncated value for each source entry.
-        String[] truncated = new String[n];
-        java.util.TreeSet<String> unique = new java.util.TreeSet<>();
-        for (int i = 0; i < n; i++) {
-            String s = ScalarFns.dateTrunc(precision, d.stringAt(i));
-            truncated[i] = s == null ? "" : s;
-            unique.add(truncated[i]);
+        return buildComputedStringDict(d, "date_trunc:" + precision, s -> {
+            String r = ScalarFns.dateTrunc(precision, s);
+            return r == null ? "" : r;
+        });
+    }
+
+    @SuppressWarnings("NullAway")
+    private static Object @Nullable [] buildRegexReplaceMap(BoundScalarCall sc,
+            io.jpointdb.core.column.@Nullable Dictionary d) {
+        if (d == null) {
+            return null;
         }
-        String[] newDict = unique.toArray(new String[0]);
-        java.util.HashMap<String, Integer> newIdByValue = new java.util.HashMap<>(newDict.length * 2);
-        for (int j = 0; j < newDict.length; j++) {
-            newIdByValue.put(newDict[j], j);
-        }
-        long[] idMap = new long[n];
-        for (int i = 0; i < n; i++) {
-            idMap[i] = newIdByValue.get(truncated[i]);
-        }
-        return new Object[]{idMap, newDict};
+        String pattern = (String) ((BoundLiteral) sc.args().get(1)).value();
+        String replacement = (String) ((BoundLiteral) sc.args().get(2)).value();
+        return buildComputedStringDict(d, "regexp_replace:" + pattern + " " + replacement,
+                s -> ScalarFns.regexpReplace(s, pattern, replacement));
+    }
+
+    /**
+     * Shared plumbing for scalar calls that rewrite each source-dict entry
+     * into a new string: applies {@code transform} to every dict entry,
+     * collects distinct results in lex order, and returns
+     * {@code [long[] old-id-to-new-id, String[] new-dict]}.
+     */
+    /**
+     * Cache for per-dict computed maps: the source dict is immutable for the
+     * life of a column, so {@code (dict, transformKey)} uniquely identifies
+     * the result. Without this, a 1M-entry Referer dict + a per-query regex
+     * walk would cost ~80 ms *every* time Q29 runs.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<ComputedDictCacheKey, Object[]> COMPUTED_DICT_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private record ComputedDictCacheKey(io.jpointdb.core.column.Dictionary dict, String transformKey) {
+    }
+
+    @SuppressWarnings("NullAway")
+    private static Object[] buildComputedStringDict(io.jpointdb.core.column.Dictionary d, String transformKey,
+            java.util.function.Function<String, @Nullable String> transform) {
+        ComputedDictCacheKey key = new ComputedDictCacheKey(d, transformKey);
+        return COMPUTED_DICT_CACHE.computeIfAbsent(key, k -> {
+            int n = d.size();
+            String[] computed = new String[n];
+            java.util.TreeSet<String> unique = new java.util.TreeSet<>();
+            for (int i = 0; i < n; i++) {
+                String s = transform.apply(d.stringAt(i));
+                computed[i] = s == null ? "" : s;
+                unique.add(computed[i]);
+            }
+            String[] newDict = unique.toArray(new String[0]);
+            java.util.HashMap<String, Integer> newIdByValue = new java.util.HashMap<>(newDict.length * 2);
+            for (int j = 0; j < newDict.length; j++) {
+                newIdByValue.put(newDict[j], j);
+            }
+            long[] idMap = new long[n];
+            for (int i = 0; i < n; i++) {
+                Integer id = newIdByValue.get(computed[i]);
+                idMap[i] = id == null ? 0 : id;
+            }
+            return new Object[]{idMap, newDict};
+        });
     }
 
     private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
