@@ -796,7 +796,15 @@ public final class Executor {
          * whose dict-id-to-long mapping is precomputed once per query, so the hot
          * scan reduces to {@code map[col.idAt(row)]} — a pure array load.
          */
-        DICT_STRING_EXTRACT_LONG
+        DICT_STRING_EXTRACT_LONG,
+        /**
+         * {@code date_trunc(<precision>, <DICT-encoded STRING column>)} — same
+         * precompute trick as {@link #DICT_STRING_EXTRACT_LONG}, but the result
+         * is a STRING. We build a new dictionary of distinct truncated values
+         * (in lex order so ORDER BY on the key matches string order) and hash
+         * by the new-dict id; materialize reads back through the new dict.
+         */
+        DICT_STRING_TRUNC_STRING
     }
 
     /**
@@ -819,7 +827,8 @@ public final class Executor {
      */
     @SuppressWarnings("ArrayRecordComponent")
     private record PrimitiveKeyShape(int[] colIdx, KeyKind[] kinds, int[] exprToKey, @Nullable Object[] literalValues,
-            long @Nullable [][] dictMaps, BoundExpr @Nullable [] derivedExprs) {
+            long @Nullable [][] dictMaps, BoundExpr @Nullable [] derivedExprs,
+            String @Nullable [][] truncDicts) {
         int width() {
             return colIdx.length;
         }
@@ -1400,7 +1409,7 @@ public final class Executor {
             BoundExpr d = derived[exprIdx];
             return evalFromKeys(d, shape, table, map, slot);
         }
-        return boxKey(table, map.keyAt(slot, keyIdx), false, shape.colIdx()[keyIdx], shape.kinds()[keyIdx]);
+        return boxKey(table, shape, keyIdx, map.keyAt(slot, keyIdx), false);
     }
 
     /**
@@ -1419,7 +1428,7 @@ public final class Executor {
                 if (ki < 0) {
                     throw new IllegalStateException("derived BoundColumn " + c.name() + " not in key");
                 }
-                yield boxKey(table, map.keyAt(slot, ki), false, shape.colIdx()[ki], shape.kinds()[ki]);
+                yield boxKey(table, shape, ki, map.keyAt(slot, ki), false);
             }
             case BoundUnary u -> applyUnary(u, evalFromKeys(u.operand(), shape, table, map, slot));
             case BoundBinary b -> applyBinary(b, evalFromKeys(b.left(), shape, table, map, slot),
@@ -1821,9 +1830,9 @@ public final class Executor {
             } else if (e instanceof BoundLiteral lit) {
                 exprToKey[i] = -1;
                 literalValues[i] = lit.value();
-            } else if (extractOverDictString(e, table) >= 0) {
-                // Each extract call gets its own precomputed key slot even if
-                // the underlying STRING column is also grouped directly.
+            } else if (extractOverDictString(e, table) >= 0 || dateTruncOverDictString(e, table) >= 0) {
+                // Each extract / date_trunc call gets its own precomputed key slot
+                // even if the underlying STRING column is also grouped directly.
                 exprToKey[i] = colCount++;
             } else {
                 // Candidate derived expr — validate in pass 3 once we know the
@@ -1841,6 +1850,7 @@ public final class Executor {
         int[] cols = new int[colCount];
         KeyKind[] kinds = new KeyKind[colCount];
         long[][] dictMaps = null;
+        String[][] truncDicts = null;
         for (int i = 0; i < g; i++) {
             int ki = exprToKey[i];
             if (ki < 0) {
@@ -1865,20 +1875,40 @@ public final class Executor {
                 }
                 cols[ki] = bc.index();
             } else if (e instanceof BoundScalarCall sc) {
-                int colIdx = extractOverDictString(sc, table);
-                if (colIdx < 0) {
-                    return null;
+                int extractCol = extractOverDictString(sc, table);
+                if (extractCol >= 0) {
+                    long[] map = buildExtractMap(sc, table.string(extractCol).dictionary());
+                    if (map == null) {
+                        return null;
+                    }
+                    if (dictMaps == null) {
+                        dictMaps = new long[colCount][];
+                    }
+                    dictMaps[ki] = map;
+                    kinds[ki] = KeyKind.DICT_STRING_EXTRACT_LONG;
+                    cols[ki] = extractCol;
+                } else {
+                    int truncCol = dateTruncOverDictString(sc, table);
+                    if (truncCol < 0) {
+                        return null;
+                    }
+                    Object[] built = buildDateTruncMap(sc, table.string(truncCol).dictionary());
+                    if (built == null) {
+                        return null;
+                    }
+                    long[] idMap = (long[]) built[0];
+                    String[] truncDict = (String[]) built[1];
+                    if (dictMaps == null) {
+                        dictMaps = new long[colCount][];
+                    }
+                    dictMaps[ki] = idMap;
+                    if (truncDicts == null) {
+                        truncDicts = new String[colCount][];
+                    }
+                    truncDicts[ki] = truncDict;
+                    kinds[ki] = KeyKind.DICT_STRING_TRUNC_STRING;
+                    cols[ki] = truncCol;
                 }
-                long[] map = buildExtractMap(sc, table.string(colIdx).dictionary());
-                if (map == null) {
-                    return null;
-                }
-                if (dictMaps == null) {
-                    dictMaps = new long[colCount][];
-                }
-                dictMaps[ki] = map;
-                kinds[ki] = KeyKind.DICT_STRING_EXTRACT_LONG;
-                cols[ki] = colIdx;
             } else {
                 return null;
             }
@@ -1895,7 +1925,7 @@ public final class Executor {
                 }
             }
         }
-        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues, dictMaps, derivedExprs);
+        return new PrimitiveKeyShape(cols, kinds, exprToKey, literalValues, dictMaps, derivedExprs, truncDicts);
     }
 
     /**
@@ -1955,7 +1985,15 @@ public final class Executor {
      * Current fast path supports {@code extract:<field>} only.
      */
     private static int extractOverDictString(BoundExpr e, Table table) {
-        if (!(e instanceof BoundScalarCall sc) || !sc.name().startsWith("extract:")) {
+        return scalarCallOverDictString(e, "extract:", table);
+    }
+
+    private static int dateTruncOverDictString(BoundExpr e, Table table) {
+        return scalarCallOverDictString(e, "date_trunc:", table);
+    }
+
+    private static int scalarCallOverDictString(BoundExpr e, String prefix, Table table) {
+        if (!(e instanceof BoundScalarCall sc) || !sc.name().startsWith(prefix)) {
             return -1;
         }
         if (sc.args().size() != 1 || !(sc.args().get(0) instanceof BoundColumn bc)) {
@@ -1996,6 +2034,43 @@ public final class Executor {
         return map;
     }
 
+    /**
+     * Builds both a dict-id → new-dict-id map and the new dict array for
+     * {@code date_trunc(<precision>, <DICT STRING col>)}. The new dict is
+     * sorted lexicographically so that ordering on the hashed long matches the
+     * ordering on the string result.
+     * <p>
+     * Returns {@code [long[] idMap, String[] newDict]}, or {@code null} if the
+     * source dictionary is missing.
+     */
+    @SuppressWarnings("NullAway")
+    private static Object @Nullable [] buildDateTruncMap(BoundScalarCall sc,
+            io.jpointdb.core.column.@Nullable Dictionary d) {
+        if (d == null) {
+            return null;
+        }
+        String precision = sc.name().substring("date_trunc:".length());
+        int n = d.size();
+        // First pass: compute truncated value for each source entry.
+        String[] truncated = new String[n];
+        java.util.TreeSet<String> unique = new java.util.TreeSet<>();
+        for (int i = 0; i < n; i++) {
+            String s = ScalarFns.dateTrunc(precision, d.stringAt(i));
+            truncated[i] = s == null ? "" : s;
+            unique.add(truncated[i]);
+        }
+        String[] newDict = unique.toArray(new String[0]);
+        java.util.HashMap<String, Integer> newIdByValue = new java.util.HashMap<>(newDict.length * 2);
+        for (int j = 0; j < newDict.length; j++) {
+            newIdByValue.put(newDict[j], j);
+        }
+        long[] idMap = new long[n];
+        for (int i = 0; i < n; i++) {
+            idMap[i] = newIdByValue.get(truncated[i]);
+        }
+        return new Object[]{idMap, newDict};
+    }
+
     private static QueryResult executeAggregatedPrimitive(BoundSelect plan, Table table, List<BoundExpr> groupExprs,
             List<BoundAgg> aggs, long n, PrimitiveKeyShape shape) {
         LongKeysAggMap merged;
@@ -2033,18 +2108,16 @@ public final class Executor {
         int[] exprToKey = shape.exprToKey();
         @Nullable
         Object[] literalValues = shape.literalValues();
-        int[] colIdx = shape.colIdx();
-        KeyKind[] kinds = shape.kinds();
         if (shape.width() == 1) {
             merged.forEachKey1((k, isNull, states) -> {
-                Object boxed = boxKey(table, k, isNull, colIdx[0], kinds[0]);
+                Object boxed = boxKey(table, shape, 0, k, isNull);
                 List<Object> key = buildKeyList(g, exprToKey, literalValues, boxed, null);
                 groups.add(new GroupEntry(key, states));
             });
         } else {
             merged.forEachKey2((a, b, isNull, states) -> {
-                Object boxedA = boxKey(table, a, isNull, colIdx[0], kinds[0]);
-                Object boxedB = boxKey(table, b, isNull, colIdx[1], kinds[1]);
+                Object boxedA = boxKey(table, shape, 0, a, isNull);
+                Object boxedB = boxKey(table, shape, 1, b, isNull);
                 List<Object> key = buildKeyList(g, exprToKey, literalValues, boxedA, boxedB);
                 groups.add(new GroupEntry(key, states));
             });
@@ -2132,11 +2205,12 @@ public final class Executor {
                     }
                 };
             }
-            case DICT_STRING_EXTRACT_LONG -> {
+            case DICT_STRING_EXTRACT_LONG, DICT_STRING_TRUNC_STRING -> {
                 io.jpointdb.core.column.StringColumn c = table.string(colIdx);
                 long[][] maps = shape.dictMaps();
                 if (maps == null || maps[keyIdx] == null) {
-                    throw new IllegalStateException("DICT_STRING_EXTRACT_LONG requires a dict map at key " + keyIdx);
+                    throw new IllegalStateException(
+                            "computed DICT key requires a dict map at key " + keyIdx);
                 }
                 long[] dictMap = maps[keyIdx];
                 yield new LongKeyReader() {
@@ -2296,10 +2370,12 @@ public final class Executor {
         }
     }
 
-    private static @Nullable Object boxKey(Table table, long k, boolean isNull, int colIdx, KeyKind kind) {
+    private static @Nullable Object boxKey(Table table, PrimitiveKeyShape shape, int keyIdx, long k, boolean isNull) {
         if (isNull) {
             return null;
         }
+        KeyKind kind = shape.kinds()[keyIdx];
+        int colIdx = shape.colIdx()[keyIdx];
         return switch (kind) {
             case I32 -> (long) (int) k;
             case I64 -> k;
@@ -2311,6 +2387,14 @@ public final class Executor {
                 yield d.stringAt((int) k);
             }
             case DICT_STRING_EXTRACT_LONG -> k;
+            case DICT_STRING_TRUNC_STRING -> {
+                String[][] dicts = shape.truncDicts();
+                if (dicts == null || dicts[keyIdx] == null) {
+                    throw new IllegalStateException(
+                            "DICT_STRING_TRUNC_STRING requires a trunc dict at key " + keyIdx);
+                }
+                yield dicts[keyIdx][(int) k];
+            }
         };
     }
 
