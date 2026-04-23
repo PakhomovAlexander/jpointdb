@@ -2516,6 +2516,29 @@ public final class Executor {
         for (int i = 0; i < aggs.size(); i++) {
             BoundAgg a = aggs.get(i);
             if (a.distinct()) {
+                // Primitive DISTINCT shortcut only covers COUNT(DISTINCT <int col>).
+                // The specialized Aggregator is chosen in Aggregator.create based
+                // on argType; here we only need to feed it via acceptLong.
+                if (a.fn() != AggregateFn.COUNT || !(a.arg() instanceof BoundColumn bc)) {
+                    return null;
+                }
+                ColumnType ct = table.columnMeta(bc.index()).type();
+                if (ct == ColumnType.I32) {
+                    I32Column c = table.i32(bc.index());
+                    out[i] = (state, row) -> {
+                        boolean n = c.isNullAt(row);
+                        state.acceptLong(n ? 0L : c.get(row), n);
+                    };
+                    continue;
+                }
+                if (ct == ColumnType.I64) {
+                    I64Column c = table.i64(bc.index());
+                    out[i] = (state, row) -> {
+                        boolean n = c.isNullAt(row);
+                        state.acceptLong(n ? 0L : c.get(row), n);
+                    };
+                    continue;
+                }
                 return null;
             }
             if (a.fn() == AggregateFn.COUNT_STAR) {

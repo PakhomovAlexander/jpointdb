@@ -36,6 +36,12 @@ abstract class Aggregator {
     abstract @Nullable Object result();
 
     static Aggregator create(AggregateFn fn, boolean distinct, @Nullable ValueType argType, ValueType resultType) {
+        // COUNT(DISTINCT <primitive-long column>) is the dominant DISTINCT shape
+        // in ClickBench (Q05/Q09/Q10/Q11/Q12/Q14 all COUNT(DISTINCT UserID)).
+        // Use a primitive-long set to avoid the HashSet<Long> boxing roundtrip.
+        if (distinct && fn == AggregateFn.COUNT && (argType == ValueType.I32 || argType == ValueType.I64)) {
+            return new CountDistinctLong();
+        }
         Aggregator base = switch (fn) {
             case COUNT_STAR -> new CountStar();
             case COUNT -> new Count();
@@ -260,6 +266,36 @@ abstract class Aggregator {
         @Nullable
         Object result() {
             return best;
+        }
+    }
+
+    /**
+     * Primitive-long COUNT(DISTINCT). Accepts via {@link #acceptLong} for the
+     * primitive column path; the boxed {@link #accept} path unwraps Numbers so
+     * generic callers still work.
+     */
+    static final class CountDistinctLong extends Aggregator {
+        final LongHashSet seen = new LongHashSet();
+        @Override
+        void accept(@Nullable Object value) {
+            if (value == null)
+                return;
+            seen.add(((Number) value).longValue());
+        }
+        @Override
+        void acceptLong(long value, boolean isNull) {
+            if (isNull)
+                return;
+            seen.add(value);
+        }
+        @Override
+        void merge(Aggregator other) {
+            seen.merge(((CountDistinctLong) other).seen);
+        }
+        @Override
+        @Nullable
+        Object result() {
+            return (long) seen.size();
         }
     }
 
